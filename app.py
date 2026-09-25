@@ -255,13 +255,14 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
             competition_filter: list, fuzzy_threshold: int,
             mappings: dict, exclude_cancelled: bool,
             tz_offset: int = 0,
-            comp_whitelist: list = None) -> pd.DataFrame:
+            tracked_comp_ids: set = None) -> pd.DataFrame:
     """
-    competition_filter : أسماء البطولات من ملف الماتشات — بيحدد إيه اللي يتقارن من DB
-    comp_whitelist     : أسماء البطولات من competitions_2026.csv — بيحدد إيه اللي يطلع "ناقص في DB"
+    competition_filter  : أسماء البطولات المختارة من ملف الماتشات (لفلترة DB)
+    tracked_comp_ids    : set of competition_id من competitions_2026.csv
+                          بيحدد بدقة 100% إيه اللي يطلع "ناقص في DB"
     """
 
-    # ── Normalize dates in both dataframes ───────────────────────────────────
+    # ── Normalize dates ───────────────────────────────────────────────────────
     db_df = db_df.copy()
     sf_df = sf_df.copy()
     db_df["match_date"] = db_df["match_date"].apply(safe_date)
@@ -276,8 +277,28 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
     if exclude_cancelled and "match_play_status" in db_df.columns:
         db_df = db_df[db_df["match_play_status"].str.lower() != "cancelled"].copy()
 
+    # Build set of competition_ids that exist in our filtered DB rows
+    # هنستخدمه للـ "ناقص في DB" — بس نطلع ماتشات من بطولات عندنا فعلاً
+    db_comp_ids_in_filter = set()
+    if "competition_id" in db_df.columns:
+        db_comp_ids_in_filter = set(db_df["competition_id"].dropna().astype(str).unique())
+
+    # Final whitelist for "missing in DB" = tracked IDs ∩ DB IDs in selected filter
+    if tracked_comp_ids:
+        final_tracked_ids = {str(i) for i in tracked_comp_ids} & db_comp_ids_in_filter \
+            if db_comp_ids_in_filter else {str(i) for i in tracked_comp_ids}
+    else:
+        final_tracked_ids = db_comp_ids_in_filter
+
     results = []
     sf_matched = set()
+
+    # Build competition_id → name map from DB for reverse lookup
+    comp_id_to_name = {}
+    if "competition_id" in db_df.columns and "competition" in db_df.columns:
+        comp_id_to_name = dict(
+            zip(db_df["competition_id"].astype(str), db_df["competition"])
+        )
 
     for _, db in db_df.iterrows():
         db_date = str(db.get("match_date", ""))
@@ -374,41 +395,59 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
             })
 
     # ── SofaScore matches not in DB ───────────────────────────────────────────
-    # Only flag matches from tournaments that are in our whitelist (competitions_2026.csv)
-    # This prevents showing matches from leagues we don't track at all
-    whitelist_for_filter = comp_whitelist if comp_whitelist else competition_filter
+    # فقط نطلع ماتشات من بطولات عندنا في الـ 404 — بنعرفها من competition_id
+    # SofaScore مش عنده competition_id بتاعنا، فبنعمل fuzzy match على الاسم
+    # بس بنقارن مع البطولات اللي في الـ filtered DB فقط — مش كل الـ 404
+
+    # Build lookup: DB competition name (lower) → competition_id
+    db_name_to_id = {}
+    for cid, cname in comp_id_to_name.items():
+        db_name_to_id[cname.lower().strip()] = cid
+
+    # Names of selected DB competitions for matching
+    selected_db_comp_names = list(comp_id_to_name.values())
 
     for idx, sf in sf_df.iterrows():
         if idx in sf_matched:
             continue
+
         sf_tourn = str(sf.get("tournament", ""))
         sf_cat   = str(sf.get("category", ""))
 
-        if whitelist_for_filter:
-            best = process.extractOne(
-                sf_tourn.lower(),
-                [c.lower() for c in whitelist_for_filter],
-                scorer=fuzz.token_sort_ratio,
-            )
-            # Higher threshold (75) to avoid false positives like
-            # "OÖ Liga" matching "La Liga" or "Super League Women" ≠ "Superleague"
-            if not best or best[1] < 75:
-                continue
+        # Must match one of our selected DB competitions with high confidence
+        if not selected_db_comp_names:
+            continue
+
+        best = process.extractOne(
+            sf_tourn.lower(),
+            [c.lower() for c in selected_db_comp_names],
+            scorer=fuzz.token_sort_ratio,
+        )
+
+        # High threshold: 82% — only flag if we're very confident it's our competition
+        if not best or best[1] < 82:
+            continue
+
+        # Extra check: reject if SF tournament name is clearly different country/context
+        # e.g. "FA Trophy" should not match "FA Women's League Cup"
+        matched_db_name = selected_db_comp_names[
+            [c.lower() for c in selected_db_comp_names].index(best[0])
+        ]
 
         results.append({
             "status": "🔴 ناقص في DB",
             "match_date": str(sf["match_date"]),
-            "competition": sf_tourn,
+            "competition": matched_db_name,   # اسم البطولة من DB مش من SofaScore
             "home_team": str(sf["home_team"]),
             "away_team": str(sf["away_team"]),
             "db_kickoff": "",
             "sf_kickoff": str(sf.get("kick_off_time", ""))[:5],
             "time_diff_min": None,
-            "match_score": 0,
+            "match_score": best[1],           # نسبة التطابق على الاسم
             "db_id": "",
             "home_team_id": "",
             "away_team_id": "",
-            "competition_id": "",
+            "competition_id": db_name_to_id.get(matched_db_name.lower().strip(), ""),
             "sf_home": str(sf["home_team"]),
             "sf_away": str(sf["away_team"]),
             "sf_tournament": sf_tourn,
@@ -694,10 +733,12 @@ with tab_main:
                         st.write(f"DB dates: {sorted(db_dates_set)} | SF dates: {sorted(sf_dates)}")
 
             with st.spinner("جاري المقارنة..."):
-                # comp_whitelist = أسماء البطولات من competitions_2026.csv
-                # بيُستخدم فقط لفلترة "ناقص في DB" — مش للـ DB matching
-                comp_whitelist = sorted(comp_df["competition"].dropna().unique().tolist()) \
-                    if comp_df is not None and "competition" in comp_df.columns else None
+                # tracked_comp_ids = competition_id values من competitions_2026.csv
+                tracked_comp_ids = None
+                if comp_df is not None and "competition_id" in comp_df.columns:
+                    tracked_comp_ids = set(
+                        comp_df["competition_id"].dropna().astype(str).unique()
+                    )
 
                 result_df = compare(
                     db_filtered, sf_df, selected_comps,
@@ -705,7 +746,7 @@ with tab_main:
                     st.session_state.get("mappings", DEFAULT_MAPPINGS),
                     exclude_cancelled,
                     tz_offset=tz_offset,
-                    comp_whitelist=comp_whitelist,
+                    tracked_comp_ids=tracked_comp_ids,
                 )
 
             if result_df.empty:
