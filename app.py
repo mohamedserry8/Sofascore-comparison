@@ -355,12 +355,25 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
         db_df = db_df[db_df["match_play_status"].str.lower() != "cancelled"].copy()
 
     # ── Build SF tournament ID whitelist from mapping ─────────────────────────
-    # لو عندنا sf_mapping: نفلتر sf_df على البطولات المرتبطة ببطولاتنا فقط
     sf_allowed_ids = None
+    use_comp_boost = True  # whether to include competition score in fuzzy
+
     if sf_mapping and "competition_id" in db_df.columns:
         sf_allowed_ids = set()
         for cid in db_df["competition_id"].dropna().astype(str).unique():
-            sf_allowed_ids.update(sf_mapping.get(cid, set()))
+            cid_clean = str(int(float(cid))) if cid.replace('.','').isdigit() else cid
+            sf_allowed_ids.update(sf_mapping.get(cid_clean, set()))
+
+    # ── Filter sf_df by tournament_id if available ────────────────────────────
+    sf_tid_col = next((c for c in sf_df.columns if c == 'tournament_id'), None)
+
+    if sf_allowed_ids and sf_tid_col:
+        sf_df_filtered = sf_df[
+            sf_df[sf_tid_col].astype(str).str.replace('.0','',regex=False).isin(sf_allowed_ids)
+        ].copy()
+        if len(sf_df_filtered) > 0:
+            sf_df = sf_df_filtered
+            use_comp_boost = False  # tournament already matched — only fuzzy on teams now
 
     # Build competition_id → name map
     comp_id_to_name = {}
@@ -396,17 +409,18 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
         for idx, sf in candidates.iterrows():
             sf_home_n = normalize(str(sf["home_team"]), {})
             sf_away_n = normalize(str(sf["away_team"]), {})
-            sf_tourn_n = str(sf.get("tournament", "")).lower().strip()
 
-            # Teams score (weight 70%)
             teams_score = (fuzz.token_sort_ratio(db_home_n, sf_home_n) +
                            fuzz.token_sort_ratio(db_away_n, sf_away_n)) / 2
 
-            # Competition boost (weight 30%) — helps avoid wrong tournament matches
-            comp_score = fuzz.token_sort_ratio(db_comp_n, sf_tourn_n)
-
-            # Combined: 70% teams + 30% competition
-            score = teams_score * 0.70 + comp_score * 0.30
+            if use_comp_boost:
+                # No tournament_id filter — add competition name boost (70/30)
+                sf_tourn_n = str(sf.get("tournament", "")).lower().strip()
+                comp_score = fuzz.token_sort_ratio(db_comp_n, sf_tourn_n)
+                score = teams_score * 0.70 + comp_score * 0.30
+            else:
+                # Tournament already filtered by ID — only match on teams (100%)
+                score = teams_score
 
             if score > best_score:
                 best_score, best_idx = score, idx
@@ -470,39 +484,57 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
     db_name_to_id = {cname.lower().strip(): cid for cid, cname in comp_id_to_name.items()}
     selected_db_comp_names = list(comp_id_to_name.values())
 
+    # Build reverse map: sf tournament_id → db competition name
+    sf_id_to_db_comp = {}
+    if sf_mapping:
+        for cid, sf_ids in sf_mapping.items():
+            db_comp_name = comp_id_to_name.get(cid, '')
+            if db_comp_name:
+                for sid in sf_ids:
+                    sf_id_to_db_comp[sid] = (db_comp_name, cid)
+
     for idx, sf in sf_df.iterrows():
         if idx in sf_matched:
             continue
 
         sf_tourn    = str(sf.get("tournament", ""))
         sf_cat      = str(sf.get("category", ""))
-        sf_tourn_id = str(sf.get("sofascore_id", ""))  # قد يكون فيه tournament_id
+        sf_tid      = str(sf.get("tournament_id", "")).replace('.0','').strip()
 
-        # ── لو عندنا mapping دقيق: استخدمه ──────────────────────────────────
-        if sf_allowed_ids is not None:
-            # SofaScore data من الـ Tampermonkey script مش فيها tournament_id منفصل
-            # بنعمل fuzzy match على اسم البطولة بس نقارن مع البطولات في الـ mapping فقط
-            if not selected_db_comp_names:
-                continue
-            best = process.extractOne(
-                sf_tourn.lower(),
-                [c.lower() for c in selected_db_comp_names],
-                scorer=fuzz.token_sort_ratio,
-            )
-            # لو عندنا mapping: threshold 85% عشان ماتشات دقيقة بس
-            if not best or best[1] < 85:
-                continue
-        else:
-            # ── Fallback: fuzzy بدون mapping ────────────────────────────────
-            if not selected_db_comp_names:
-                continue
-            best = process.extractOne(
-                sf_tourn.lower(),
-                [c.lower() for c in selected_db_comp_names],
-                scorer=fuzz.token_sort_ratio,
-            )
-            if not best or best[1] < 82:
-                continue
+        # ── Method 1: exact tournament_id match (most reliable) ──────────────
+        if sf_tid and sf_tid in sf_id_to_db_comp:
+            matched_db_name, matched_comp_id = sf_id_to_db_comp[sf_tid]
+            results.append({
+                "status": "🔴 ناقص في DB",
+                "match_date": str(sf["match_date"]),
+                "competition": matched_db_name,
+                "home_team": str(sf["home_team"]),
+                "away_team": str(sf["away_team"]),
+                "db_kickoff": "",
+                "sf_kickoff": str(sf.get("kick_off_time", ""))[:5],
+                "time_diff_min": None,
+                "match_score": 100,
+                "db_id": "",
+                "home_team_id": "",
+                "away_team_id": "",
+                "competition_id": matched_comp_id,
+                "sf_home": str(sf["home_team"]),
+                "sf_away": str(sf["away_team"]),
+                "sf_tournament": sf_tourn,
+                "sf_category": sf_cat,
+            })
+            continue
+
+        # ── Method 2: fuzzy fallback (when no tournament_id in CSV) ──────────
+        if not selected_db_comp_names:
+            continue
+        best = process.extractOne(
+            sf_tourn.lower(),
+            [c.lower() for c in selected_db_comp_names],
+            scorer=fuzz.token_sort_ratio,
+        )
+        if not best or best[1] < 85:
+            continue
 
         matched_db_name = selected_db_comp_names[
             [c.lower() for c in selected_db_comp_names].index(best[0])
