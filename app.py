@@ -279,41 +279,46 @@ def apply_tz_offset(df: pd.DataFrame, offset_hours: int) -> pd.DataFrame:
 
 def build_sf_mapping(mapping_df: pd.DataFrame) -> dict:
     """
-    من الـ Google Sheet — بيبني دكشنري:
-      competition_id (str) → set({sofascore_tournament_id, ...})
-
-    بيدعم:
-    - خلية فيها ID واحد:  "17"
-    - خلية فيها أكتر:     "59834, 59835, 59842"  أو  "59834\n59835"
-    - خلية فاضية أو "Not in Sofascore": بيتجاهلها
+    competition_id (str) → set({sofascore_tournament_id, ...})
+    Handles: single IDs, comma-separated, newline-separated, NaN, 'Not in Sofascore'
     """
     if mapping_df.empty:
         return {}
 
+    import re
+
     cols = mapping_df.columns.tolist()
 
-    comp_id_col = next((c for c in cols if 'competition_id' in c), None)
-    sf_id_col   = next((c for c in cols if 'sofascore' in c and ('tournament_id' in c or 'id' in c) and 'name' not in c), None)
+    # Find columns — exact match first, then partial
+    comp_id_col = next((c for c in cols if c == 'competition_id'), None) or \
+                  next((c for c in cols if 'competition_id' in c), None)
+    sf_id_col   = next((c for c in cols if c == 'sofascore_tournament_id'), None) or \
+                  next((c for c in cols if 'sofascore' in c and 'id' in c and 'name' not in c), None)
 
     if not comp_id_col or not sf_id_col:
         return {}
 
     result = {}
     for _, row in mapping_df.iterrows():
-        cid = str(row.get(comp_id_col, "")).strip()
-        raw = str(row.get(sf_id_col, "")).strip()
-
-        if not cid or cid == 'nan':
+        # competition_id
+        cid_raw = row.get(comp_id_col, '')
+        if pd.isna(cid_raw) or str(cid_raw).strip() in ('', 'nan', 'None'):
             continue
-        if not raw or raw == 'nan' or 'not in sofascore' in raw.lower():
+        cid = str(int(float(str(cid_raw).strip()))) if str(cid_raw).strip().replace('.','').isdigit() else str(cid_raw).strip()
+
+        # sofascore_tournament_id — may be multiple values
+        sid_raw = row.get(sf_id_col, '')
+        if pd.isna(sid_raw):
+            continue
+        raw = str(sid_raw).strip()
+        if not raw or raw.lower() in ('nan', 'none', 'not in sofascore', 'n/a', '-'):
             continue
 
-        # Split on comma, newline, semicolon, or space
-        import re
+        # Split on comma, newline, semicolon, space
         parts = re.split(r'[,\n;\s]+', raw)
         ids = set()
         for p in parts:
-            p = p.strip()
+            p = p.strip().replace('.0', '')  # handle float like "17.0"
             if p and p.isdigit():
                 ids.add(p)
 
@@ -537,7 +542,16 @@ st.caption("قارن بياناتك مع SofaScore — اكتشف الماتشا
 with st.sidebar:
     st.header("⚙️ الإعدادات")
 
-    today = datetime.today().date()
+    today = datetime.now(tz=None).date()
+    # Use UTC+3 (Cairo) for correct local date
+    from datetime import timezone
+    import zoneinfo
+    try:
+        cairo_tz = zoneinfo.ZoneInfo("Africa/Cairo")
+        today = datetime.now(tz=cairo_tz).date()
+    except Exception:
+        # fallback: UTC+3
+        today = (datetime.utcnow() + timedelta(hours=3)).date()
     st.subheader("📅 نطاق التاريخ")
     preset = st.radio("اختصارات", ["اليوم", "اليوم + بكرة", "أسبوع قادم", "مخصص"],
                       index=2, horizontal=True)
