@@ -1013,6 +1013,70 @@ with tab_main:
                         st.error("⚠️ مفيش تواريخ مشتركة! تأكد من الـ timezone offset.")
                         st.write(f"DB dates: {sorted(db_dates_set)} | SF dates: {sorted(sf_dates)}")
 
+                    # ── SofaScore coverage per competition ────────────────────
+                    st.divider()
+                    st.write("**📊 تغطية SofaScore لكل بطولة في DB:**")
+
+                    coverage_rows = []
+                    for comp in sorted(db_filtered["competition"].dropna().unique()):
+                        db_sub = db_filtered[db_filtered["competition"] == comp]
+                        n_db = len(db_sub)
+
+                        # Which SF tournament_ids should cover this competition?
+                        comp_ids = db_sub["competition_id"].dropna().astype(str).unique()
+                        expected_sf_ids = set()
+                        for cid in comp_ids:
+                            cid_c = str(int(float(cid))) if cid.replace('.','').isdigit() else cid
+                            expected_sf_ids.update(sf_mapping.get(cid_c, set()))
+
+                        # How many SF matches actually present with those ids?
+                        sf_tid_col = next((c for c in sf_df.columns if c == 'tournament_id'), None)
+                        n_sf = 0
+                        if sf_tid_col and expected_sf_ids:
+                            n_sf = len(sf_df[
+                                sf_df[sf_tid_col].astype(str)
+                                    .str.replace('.0','',regex=False)
+                                    .isin(expected_sf_ids)
+                            ])
+
+                        status = "✅" if n_sf > 0 else ("⚠️ مش مربوطة" if not expected_sf_ids else "❌ مفيش داتا")
+                        coverage_rows.append({
+                            "البطولة": comp,
+                            "ماتشات DB": n_db,
+                            "ماتشات SF": n_sf,
+                            "SF IDs متوقعة": len(expected_sf_ids),
+                            "الحالة": status,
+                        })
+
+                    cov_df = pd.DataFrame(coverage_rows).sort_values("ماتشات DB", ascending=False)
+
+                    # Summary
+                    n_ok      = len(cov_df[cov_df["الحالة"] == "✅"])
+                    n_unmapped = len(cov_df[cov_df["الحالة"] == "⚠️ مش مربوطة"])
+                    n_nodata   = len(cov_df[cov_df["الحالة"] == "❌ مفيش داتا"])
+
+                    cs1, cs2, cs3 = st.columns(3)
+                    cs1.metric("✅ مغطّاة", n_ok)
+                    cs2.metric("⚠️ مش مربوطة في الـ Sheet", n_unmapped)
+                    cs3.metric("❌ مربوطة بس مفيش داتا", n_nodata)
+
+                    st.dataframe(cov_df, use_container_width=True, height=300)
+
+                    if n_unmapped > 0:
+                        missing_map = cov_df[cov_df["الحالة"] == "⚠️ مش مربوطة"]
+                        st.warning(
+                            f"**{n_unmapped} بطولة محتاجة mapping في الـ Master tab:**\n\n" +
+                            ", ".join(missing_map["البطولة"].head(25).tolist())
+                        )
+
+                    if n_nodata > 0:
+                        nodata = cov_df[cov_df["الحالة"] == "❌ مفيش داتا"]
+                        st.error(
+                            f"**{n_nodata} بطولة مربوطة بس الـ Tampermonkey مجابهاش:**\n\n" +
+                            ", ".join(nodata["البطولة"].head(25).tolist()) +
+                            "\n\n💡 افتح الدولة بتاعتها على sofascore.com واضغط 'افتح كل البطولات' تاني"
+                        )
+
             with st.spinner("جاري المقارنة..."):
                 # tracked_comp_ids = competition_id values من competitions_2026.csv
                 tracked_comp_ids = None
