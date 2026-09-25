@@ -221,30 +221,75 @@ def parse_sofascore_csv(uploaded_file) -> tuple[pd.DataFrame, str]:
 
 
 # ─── Comparison engine ────────────────────────────────────────────────────────
+import unicodedata
+
+# Common abbreviation expansions (SofaScore uses short forms)
+ABBREV_MAP = {
+    r'\batl\.?\b': 'atletico', r'\batletico\b': 'atletico',
+    r'\bdep\.?\b': 'deportivo', r'\bdeportivo\b': 'deportivo',
+    r'\bhfx\b': 'halifax',
+    r'\bman\.?\b': 'manchester',
+    r'\bnott\.?\b': 'nottingham',
+    r'\bwolves\b': 'wolverhampton',
+    r'\bspurs\b': 'tottenham',
+    r'\bst\.?\b': 'saint',
+    r'\butd\.?\b': 'united',
+    r'\bsp\.?\b': 'sporting',
+    r'\brc\b': 'racing',
+    r'\bkc\b': 'kansas city',
+    r'\bnyc\b': 'new york city',
+    r'\bny\b': 'new york',
+    r'\bla\b': 'los angeles',
+    r'\bpsg\b': 'paris saint germain',
+}
+
+NOISE_PATTERNS = [
+    r'\bfc\b', r'\bcf\b', r'\bsc\b', r'\bac\b', r'\bafc\b',
+    r'\bwfc\b', r'\bfk\b', r'\bsk\b', r'\bif\b', r'\bik\b',
+    r'\bsv\b', r'\btsv\b', r'\bvfb\b', r'\bvfl\b', r'\bclub\b',
+    r'\bec\b', r'\bcd\b', r'\bca\b', r'\bas\b', r'\bssc\b',
+    r'\b\d{4}\b',          # years like 1907
+    r'[.\-–—&\']',         # punctuation
+]
+
+
+def strip_accents(s: str) -> str:
+    """Remove diacritics: Atlético → Atletico, Muriaé → Muriae"""
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', str(s))
+        if unicodedata.category(c) != 'Mn'
+    )
+
+
 def normalize(name: str, mappings: dict) -> str:
     """
-    Normalize team name for fuzzy matching.
-    Strips common suffixes/prefixes that differ between sources.
+    Normalize team name for fuzzy matching:
+    1. Apply user-defined mappings (exact match)
+    2. Strip accents
+    3. Expand abbreviations (Atl. → Atletico, HFX → Halifax)
+    4. Remove club-type noise words (FC, SC, WFC...)
     """
     import re
-    n = str(name).strip()
-    n = mappings.get(n, n)
-    n = n.lower().strip()
 
-    # Remove common club-type words that differ between sources
-    noise = [
-        r'\bfc\b', r'\bcf\b', r'\bsc\b', r'\bac\b', r'\bafc\b', r'\bcd\b',
-        r'\bclub\b', r'\bclub atlético\b', r'\bclub atletico\b',
-        r'\bwfc\b', r'\bfk\b', r'\bsk\b', r'\bif\b', r'\bik\b',
-        r'\bunion\b', r'\bsv\b', r'\btsv\b', r'\bvfb\b', r'\bvfl\b',
-        r'\b\d{4}\b',  # years like 1907
-    ]
-    for pattern in noise:
-        n = re.sub(pattern, ' ', n)
+    raw = str(name).strip()
 
-    # Collapse whitespace
+    # 1. Exact mapping lookup (before any normalization)
+    if raw in mappings:
+        raw = mappings[raw]
+
+    # 2. Strip accents + lowercase
+    n = strip_accents(raw).lower().strip()
+
+    # 3. Expand abbreviations
+    for pat, rep in ABBREV_MAP.items():
+        n = re.sub(pat, rep, n)
+
+    # 4. Remove noise
+    for pat in NOISE_PATTERNS:
+        n = re.sub(pat, ' ', n)
+
     n = re.sub(r'\s+', ' ', n).strip()
-    return n if n else str(name).lower().strip()
+    return n if n else strip_accents(raw).lower().strip()
 
 
 def safe_date(val) -> str:
@@ -297,7 +342,38 @@ def apply_tz_offset(df: pd.DataFrame, offset_hours: int) -> pd.DataFrame:
     return df.apply(shift_row, axis=1)
 
 
-def build_sf_mapping(mapping_df: pd.DataFrame) -> dict:
+@st.cache_data(ttl=300, show_spinner=False)
+def load_team_mapping_from_sheet(sheet_id: str, gid: str = "1") -> dict:
+    """
+    Load team name mapping from a second tab in the Google Sheet.
+    Expected columns: db_team_name, sofascore_team_name
+    Returns: { "Club Brugge W": "Club YLA", ... }
+    """
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    try:
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200:
+            return {}
+        df = pd.read_csv(io.StringIO(resp.text))
+        df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+        db_col = next((c for c in df.columns if 'db' in c and 'team' in c), None) or \
+                 next((c for c in df.columns if c in ('db_team_name','db_name','our_name')), None)
+        sf_col = next((c for c in df.columns if 'sofascore' in c and 'team' in c), None) or \
+                 next((c for c in df.columns if c in ('sofascore_team_name','sf_name','sofascore_name')), None)
+
+        if not db_col or not sf_col:
+            return {}
+
+        result = {}
+        for _, row in df.iterrows():
+            db_name = str(row.get(db_col, '')).strip()
+            sf_name = str(row.get(sf_col, '')).strip()
+            if db_name and sf_name and db_name.lower() != 'nan' and sf_name.lower() != 'nan':
+                result[db_name] = sf_name
+        return result
+    except Exception:
+        return {}
     """
     competition_id (str) → set({sofascore_tournament_id, ...})
     Handles: single IDs, comma-separated, newline-separated, NaN, 'Not in Sofascore'
@@ -663,11 +739,18 @@ with st.sidebar:
         sf_mapping = build_sf_mapping(mapping_df)
         mapped_count = sum(len(v) for v in sf_mapping.values())
         st.success(f"✅ {len(sf_mapping)} بطولة مربوطة ({mapped_count} tournament IDs)")
+
+        # Load team name mapping from tab 2
+        team_map_sheet = load_team_mapping_from_sheet(SHEET_ID, gid="1")
+        if team_map_sheet:
+            st.info(f"🔗 {len(team_map_sheet)} فريق مربوط يدوياً")
+        st.session_state.team_map_sheet = team_map_sheet
+
         with st.expander("🔍 Debug الـ mapping"):
-            st.write("**الأعمدة الموجودة:**", mapping_df.columns.tolist())
-            st.write("**أول 3 صفوف:**")
-            st.dataframe(mapping_df.head(3))
+            st.write("**الأعمدة:**", mapping_df.columns.tolist())
             st.write("**sf_mapping sample:**", dict(list(sf_mapping.items())[:3]))
+            if team_map_sheet:
+                st.write("**team mapping sample:**", dict(list(team_map_sheet.items())[:5]))
     else:
         st.warning("⚠️ الـ mapping فاضي")
 
@@ -909,10 +992,17 @@ with tab_main:
                         comp_df["competition_id"].dropna().astype(str).unique()
                     )
 
+                # Merge: session mappings + sheet team mappings + defaults
+                combined_mappings = {
+                    **DEFAULT_MAPPINGS,
+                    **st.session_state.get("mappings", {}),
+                    **st.session_state.get("team_map_sheet", {}),
+                }
+
                 result_df = compare(
                     db_filtered, sf_df, selected_comps,
                     fuzzy_threshold,
-                    st.session_state.get("mappings", DEFAULT_MAPPINGS),
+                    combined_mappings,
                     exclude_cancelled,
                     tz_offset=tz_offset,
                     tracked_comp_ids=tracked_comp_ids,
