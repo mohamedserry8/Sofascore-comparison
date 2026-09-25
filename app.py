@@ -349,10 +349,8 @@ def load_team_mapping_from_sheet(sheet_id: str) -> tuple[dict, str]:
     Expected columns: db_team_name, sofascore_team_name
     Returns: ({ "Club Brugge W": "Club YLA", ... }, found_gid)
     """
-    # Try common gids — Google assigns arbitrary gids to new tabs
-    candidate_gids = ["1", "2", "3", "4",
-                      "1000000000", "1234567890",
-                      "123456789", "987654321"]
+    # Known team-mapping tab gid first, then fallbacks
+    candidate_gids = ["251946082", "1", "2", "3", "4"]
 
     # Also try to discover gids from the sheet's HTML
     try:
