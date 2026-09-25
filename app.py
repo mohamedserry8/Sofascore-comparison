@@ -254,7 +254,12 @@ def apply_tz_offset(df: pd.DataFrame, offset_hours: int) -> pd.DataFrame:
 def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
             competition_filter: list, fuzzy_threshold: int,
             mappings: dict, exclude_cancelled: bool,
-            tz_offset: int = 0) -> pd.DataFrame:
+            tz_offset: int = 0,
+            comp_whitelist: list = None) -> pd.DataFrame:
+    """
+    competition_filter : أسماء البطولات من ملف الماتشات — بيحدد إيه اللي يتقارن من DB
+    comp_whitelist     : أسماء البطولات من competitions_2026.csv — بيحدد إيه اللي يطلع "ناقص في DB"
+    """
 
     # ── Normalize dates in both dataframes ───────────────────────────────────
     db_df = db_df.copy()
@@ -368,20 +373,28 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
                 "sf_category": "",
             })
 
-    # SofaScore matches not matched to any DB row
+    # ── SofaScore matches not in DB ───────────────────────────────────────────
+    # Only flag matches from tournaments that are in our whitelist (competitions_2026.csv)
+    # This prevents showing matches from leagues we don't track at all
+    whitelist_for_filter = comp_whitelist if comp_whitelist else competition_filter
+
     for idx, sf in sf_df.iterrows():
         if idx in sf_matched:
             continue
         sf_tourn = str(sf.get("tournament", ""))
         sf_cat   = str(sf.get("category", ""))
-        if competition_filter:
+
+        if whitelist_for_filter:
             best = process.extractOne(
                 sf_tourn.lower(),
-                [c.lower() for c in competition_filter],
+                [c.lower() for c in whitelist_for_filter],
                 scorer=fuzz.token_sort_ratio,
             )
-            if not best or best[1] < 60:
+            # Higher threshold (75) to avoid false positives like
+            # "OÖ Liga" matching "La Liga" or "Super League Women" ≠ "Superleague"
+            if not best or best[1] < 75:
                 continue
+
         results.append({
             "status": "🔴 ناقص في DB",
             "match_date": str(sf["match_date"]),
@@ -681,12 +694,18 @@ with tab_main:
                         st.write(f"DB dates: {sorted(db_dates_set)} | SF dates: {sorted(sf_dates)}")
 
             with st.spinner("جاري المقارنة..."):
+                # comp_whitelist = أسماء البطولات من competitions_2026.csv
+                # بيُستخدم فقط لفلترة "ناقص في DB" — مش للـ DB matching
+                comp_whitelist = sorted(comp_df["competition"].dropna().unique().tolist()) \
+                    if comp_df is not None and "competition" in comp_df.columns else None
+
                 result_df = compare(
                     db_filtered, sf_df, selected_comps,
                     fuzzy_threshold,
                     st.session_state.get("mappings", DEFAULT_MAPPINGS),
                     exclude_cancelled,
                     tz_offset=tz_offset,
+                    comp_whitelist=comp_whitelist,
                 )
 
             if result_df.empty:
