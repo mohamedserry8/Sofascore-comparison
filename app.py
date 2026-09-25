@@ -588,6 +588,11 @@ with st.sidebar:
         sf_mapping = build_sf_mapping(mapping_df)
         mapped_count = sum(len(v) for v in sf_mapping.values())
         st.success(f"✅ {len(sf_mapping)} بطولة مربوطة ({mapped_count} tournament IDs)")
+        with st.expander("🔍 Debug الـ mapping"):
+            st.write("**الأعمدة الموجودة:**", mapping_df.columns.tolist())
+            st.write("**أول 3 صفوف:**")
+            st.dataframe(mapping_df.head(3))
+            st.write("**sf_mapping sample:**", dict(list(sf_mapping.items())[:3]))
     else:
         st.warning("⚠️ الـ mapping فاضي")
 
