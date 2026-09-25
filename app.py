@@ -625,12 +625,43 @@ with tab_main:
                 st.warning("⚠️ مفيش بيانات SofaScore")
                 st.stop()
 
-            st.info(f"📊 {len(sf_df):,} ماتش من SofaScore — جاري المقارنة...")
-
+            # ── Filter DB by date range ───────────────────────────────────────
             db_filtered = db_df[
                 (db_df["match_date"] >= date_from.strftime("%Y-%m-%d")) &
                 (db_df["match_date"] <= date_to.strftime("%Y-%m-%d"))
             ].copy()
+
+            # ── DEBUG: show what we're working with ───────────────────────────
+            with st.expander("🔍 Debug — إيه اللي بيتقارن بالظبط", expanded=True):
+                d1, d2, d3 = st.columns(3)
+                d1.metric("DB بعد فلتر التاريخ", len(db_filtered))
+                d2.metric("SofaScore ماتشات", len(sf_df))
+                d3.metric("البطولات المختارة", len(selected_comps))
+
+                # DB comps vs selected
+                if len(db_filtered) == 0:
+                    st.error(f"⚠️ مفيش ماتشات في DB للفترة {date_from} ← {date_to}. تأكد من الـ date range في الـ sidebar.")
+                    db_dates = db_df["match_date"].dropna().unique()
+                    st.write(f"التواريخ الموجودة في DB: {sorted(db_dates)[:10]}")
+                else:
+                    db_comps_in_range = set(db_filtered["competition"].unique())
+                    matched_comps = db_comps_in_range & set(selected_comps)
+                    unmatched_comps = db_comps_in_range - set(selected_comps)
+
+                    st.write(f"**بطولات DB في الفترة دي:** {len(db_comps_in_range)} بطولة")
+                    st.write(f"**منها محددة في الفلتر:** {len(matched_comps)} ✅ | **غير محددة:** {len(unmatched_comps)} ⚠️")
+
+                    if unmatched_comps:
+                        st.warning(f"البطولات دي موجودة في DB بس مش محددة في الفلتر — مش هتتقارن:\n{sorted(unmatched_comps)}")
+
+                    sf_dates = set(sf_df["match_date"].unique())
+                    db_dates_set = set(db_filtered["match_date"].unique())
+                    common_dates = sf_dates & db_dates_set
+                    st.write(f"**تواريخ مشتركة بين DB و SofaScore:** {sorted(common_dates)}")
+
+                    if not common_dates:
+                        st.error("⚠️ مفيش تواريخ مشتركة! تأكد من الـ timezone offset.")
+                        st.write(f"DB dates: {sorted(db_dates_set)} | SF dates: {sorted(sf_dates)}")
 
             with st.spinner("جاري المقارنة..."):
                 result_df = compare(
@@ -640,6 +671,10 @@ with tab_main:
                     exclude_cancelled,
                     tz_offset=tz_offset,
                 )
+
+            if result_df.empty:
+                st.warning("⚠️ النتيجة فاضية — تأكد من الـ debug فوق")
+                st.stop()
 
             st.session_state.result_df = result_df
             st.session_state.sf_df = sf_df
@@ -654,24 +689,35 @@ with tab_main:
             n_extra = counts.get("🟡 مش في SofaScore", 0)
             n_time  = counts.get("⏱ فرق كيك أوف", 0)
             n_ok    = counts.get("✓ متطابق", 0)
-            pct_ok  = round(n_ok / total * 100) if total else 0
+
+            # DB-side totals (rows that came from DB)
+            db_side  = n_extra + n_time + n_ok   # ماتشات DB اللي اتقارنت
+            pct_ok   = round(n_ok / db_side * 100) if db_side else 0
+
+            # ── Summary banner ────────────────────────────────────────────────
+            st.markdown(f"""
+<div style="background:#1e2535;border:1px solid #2a3147;border-radius:10px;padding:14px 20px;margin-bottom:12px">
+<b style="color:#e2e8f0;font-size:15px">📊 ملخص المقارنة</b><br>
+<span style="color:#8892a4;font-size:13px">
+من الـ <b style="color:#e2e8f0">{db_side}</b> ماتش اللي جايين من DB:
+&nbsp;✓ <b style="color:#22c55e">{n_ok} متطابق ({pct_ok}%)</b>
+&nbsp;|&nbsp; ⏱ <b style="color:#a78bfa">{n_time} فرق وقت</b>
+&nbsp;|&nbsp; 🟡 <b style="color:#f59e0b">{n_extra} مش في SofaScore</b>
+&nbsp;&nbsp;&nbsp;&nbsp; + موجود على SofaScore بس مش في DB: <b style="color:#ef4444">{n_miss}</b>
+</span>
+</div>
+""", unsafe_allow_html=True)
 
             # ── Metrics row ──────────────────────────────────────────────────
             c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("🔴 ناقص في DB",       n_miss,
-                      help="موجود على SofaScore مش موجود عندك")
-            c2.metric("🟡 مش في SofaScore",  n_extra,
-                      help="موجود عندك مش لاقيه على SofaScore")
-            c3.metric("⏱ فرق كيك أوف",      n_time,
-                      help="الماتش متطابق بس الوقت مختلف")
+            c1.metric("🔴 ناقص في DB",       n_miss,  help="موجود على SofaScore مش موجود عندك")
+            c2.metric("🟡 مش في SofaScore",  n_extra, help="موجود عندك مش لاقيه على SofaScore")
+            c3.metric("⏱ فرق كيك أوف",      n_time,  help="الماتش متطابق بس الوقت مختلف")
             c4.metric("✓ متطابق",            n_ok)
-            c5.metric("نسبة التطابق",        f"{pct_ok}%",
-                      delta=f"{n_ok} من {total}",
-                      delta_color="normal")
+            c5.metric("دقة DB",              f"{pct_ok}%", delta=f"{n_ok}/{db_side}")
 
-            # ── Match accuracy bar ───────────────────────────────────────────
             st.progress(pct_ok / 100,
-                        text=f"دقة المطابقة: {pct_ok}% ({n_ok} متطابق من {total} ماتش)")
+                        text=f"دقة مطابقة DB: {pct_ok}% — {n_ok} متطابق من {db_side} ماتش DB")
 
             st.divider()
 
