@@ -343,37 +343,65 @@ def apply_tz_offset(df: pd.DataFrame, offset_hours: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_team_mapping_from_sheet(sheet_id: str, gid: str = "1") -> dict:
+def load_team_mapping_from_sheet(sheet_id: str) -> tuple[dict, str]:
     """
-    Load team name mapping from a second tab in the Google Sheet.
+    Load team name mapping by scanning sheet tabs for the right columns.
     Expected columns: db_team_name, sofascore_team_name
-    Returns: { "Club Brugge W": "Club YLA", ... }
+    Returns: ({ "Club Brugge W": "Club YLA", ... }, found_gid)
     """
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    # Try common gids — Google assigns arbitrary gids to new tabs
+    candidate_gids = ["1", "2", "3", "4",
+                      "1000000000", "1234567890",
+                      "123456789", "987654321"]
+
+    # Also try to discover gids from the sheet's HTML
     try:
-        resp = requests.get(url, timeout=15)
-        if resp.status_code != 200:
-            return {}
-        df = pd.read_csv(io.StringIO(resp.text))
-        df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
-
-        db_col = next((c for c in df.columns if 'db' in c and 'team' in c), None) or \
-                 next((c for c in df.columns if c in ('db_team_name','db_name','our_name')), None)
-        sf_col = next((c for c in df.columns if 'sofascore' in c and 'team' in c), None) or \
-                 next((c for c in df.columns if c in ('sofascore_team_name','sf_name','sofascore_name')), None)
-
-        if not db_col or not sf_col:
-            return {}
-
-        result = {}
-        for _, row in df.iterrows():
-            db_name = str(row.get(db_col, '')).strip()
-            sf_name = str(row.get(sf_col, '')).strip()
-            if db_name and sf_name and db_name.lower() != 'nan' and sf_name.lower() != 'nan':
-                result[db_name] = sf_name
-        return result
+        html_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit"
+        r = requests.get(html_url, timeout=10)
+        if r.status_code == 200:
+            import re as _re
+            found = _re.findall(r'"sheetId":(\d+)', r.text)
+            candidate_gids = list(dict.fromkeys(found + candidate_gids))
     except Exception:
-        return {}
+        pass
+
+    for gid in candidate_gids[:20]:
+        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+        try:
+            resp = requests.get(url, timeout=12)
+            if resp.status_code != 200:
+                continue
+            df = pd.read_csv(io.StringIO(resp.text))
+            df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+
+            db_col = next((c for c in df.columns
+                           if c in ('db_team_name', 'db_name', 'our_name')), None) or \
+                     next((c for c in df.columns if 'db' in c and 'team' in c), None)
+            sf_col = next((c for c in df.columns
+                           if c in ('sofascore_team_name', 'sf_name', 'sofascore_name')), None) or \
+                     next((c for c in df.columns if 'sofascore' in c and 'team' in c), None)
+
+            if not db_col or not sf_col:
+                continue
+
+            result = {}
+            for _, row in df.iterrows():
+                db_name = str(row.get(db_col, '')).strip()
+                sf_name = str(row.get(sf_col, '')).strip()
+                if (db_name and sf_name
+                        and db_name.lower() not in ('nan', 'none', '')
+                        and sf_name.lower() not in ('nan', 'none', '')):
+                    result[db_name] = sf_name
+
+            if result:
+                return result, gid
+        except Exception:
+            continue
+
+    return {}, ""
+
+
+def build_sf_mapping(mapping_df: pd.DataFrame) -> dict:
     """
     competition_id (str) → set({sofascore_tournament_id, ...})
     Handles: single IDs, comma-separated, newline-separated, NaN, 'Not in Sofascore'
@@ -740,17 +768,20 @@ with st.sidebar:
         mapped_count = sum(len(v) for v in sf_mapping.values())
         st.success(f"✅ {len(sf_mapping)} بطولة مربوطة ({mapped_count} tournament IDs)")
 
-        # Load team name mapping from tab 2
-        team_map_sheet = load_team_mapping_from_sheet(SHEET_ID, gid="1")
+        # Load team name mapping — auto-discovers the right tab
+        team_map_sheet, found_gid = load_team_mapping_from_sheet(SHEET_ID)
         if team_map_sheet:
             st.info(f"🔗 {len(team_map_sheet)} فريق مربوط يدوياً")
         st.session_state.team_map_sheet = team_map_sheet
 
         with st.expander("🔍 Debug الـ mapping"):
-            st.write("**الأعمدة:**", mapping_df.columns.tolist())
+            st.write("**أعمدة Master:**", mapping_df.columns.tolist())
             st.write("**sf_mapping sample:**", dict(list(sf_mapping.items())[:3]))
+            st.write("**team mapping gid:**", found_gid or "مش لاقيه")
             if team_map_sheet:
-                st.write("**team mapping sample:**", dict(list(team_map_sheet.items())[:5]))
+                st.write("**team mapping:**", team_map_sheet)
+            else:
+                st.warning("مش لاقي tab التيمز — تأكد إن الأعمدة اسمها db_team_name و sofascore_team_name")
     else:
         st.warning("⚠️ الـ mapping فاضي")
 
