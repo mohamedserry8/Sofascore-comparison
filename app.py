@@ -280,30 +280,47 @@ def apply_tz_offset(df: pd.DataFrame, offset_hours: int) -> pd.DataFrame:
 def build_sf_mapping(mapping_df: pd.DataFrame) -> dict:
     """
     من الـ Google Sheet — بيبني دكشنري:
-      competition_id (str) → [sofascore_tournament_id, ...]
-    بيدعم علاقة many-to-many (بطولة عندك → أكتر من tournament في SofaScore والعكس)
+      competition_id (str) → set({sofascore_tournament_id, ...})
+
+    بيدعم:
+    - خلية فيها ID واحد:  "17"
+    - خلية فيها أكتر:     "59834, 59835, 59842"  أو  "59834\n59835"
+    - خلية فاضية أو "Not in Sofascore": بيتجاهلها
     """
     if mapping_df.empty:
         return {}
 
     cols = mapping_df.columns.tolist()
 
-    # detect column names flexibly
     comp_id_col = next((c for c in cols if 'competition_id' in c), None)
-    sf_id_col   = next((c for c in cols if 'sofascore' in c and 'id' in c), None)
+    sf_id_col   = next((c for c in cols if 'sofascore' in c and ('tournament_id' in c or 'id' in c) and 'name' not in c), None)
 
     if not comp_id_col or not sf_id_col:
         return {}
 
     result = {}
     for _, row in mapping_df.iterrows():
-        cid = str(row[comp_id_col]).strip()
-        sid = str(row[sf_id_col]).strip()
-        if not cid or not sid or cid == 'nan' or sid == 'nan':
-            continue
-        result.setdefault(cid, set()).add(sid)
+        cid = str(row.get(comp_id_col, "")).strip()
+        raw = str(row.get(sf_id_col, "")).strip()
 
-    return result  # { "2": {"17"}, "11": {"8", "955"}, ... }
+        if not cid or cid == 'nan':
+            continue
+        if not raw or raw == 'nan' or 'not in sofascore' in raw.lower():
+            continue
+
+        # Split on comma, newline, semicolon, or space
+        import re
+        parts = re.split(r'[,\n;\s]+', raw)
+        ids = set()
+        for p in parts:
+            p = p.strip()
+            if p and p.isdigit():
+                ids.add(p)
+
+        if ids:
+            result.setdefault(cid, set()).update(ids)
+
+    return result
 
 
 def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
