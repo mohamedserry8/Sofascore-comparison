@@ -5,6 +5,32 @@ from datetime import datetime, timedelta
 from rapidfuzz import fuzz, process
 import time
 import random
+import io
+
+# ─── Google Sheet Mapping ─────────────────────────────────────────────────────
+SHEET_ID = "14tUgMxJI_glunJiyg8F61D5oduorWJRBRzHfT8zGRtU"
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_mapping_from_sheet(sheet_id: str) -> tuple[pd.DataFrame, str]:
+    """
+    Load competition → sofascore_tournament_id mapping from Google Sheet.
+    Returns (DataFrame, error_msg).
+    Sheet columns expected: competition_id, sofascore_tournament_id (+ others optional)
+    """
+    # Try each tab by gid — gid=0 is Master tab
+    for gid in ["0"]:
+        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+        try:
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                df = pd.read_csv(io.StringIO(resp.text))
+                df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+                return df, ""
+            elif resp.status_code == 403:
+                return pd.DataFrame(), "الـ Sheet مش public — تأكد من إعدادات المشاركة"
+        except Exception as e:
+            return pd.DataFrame(), str(e)
+    return pd.DataFrame(), "تعذّر جلب الـ Sheet"
 
 st.set_page_config(
     page_title="Match Comparator ⚽",
@@ -251,15 +277,45 @@ def apply_tz_offset(df: pd.DataFrame, offset_hours: int) -> pd.DataFrame:
     return df.apply(shift_row, axis=1)
 
 
+def build_sf_mapping(mapping_df: pd.DataFrame) -> dict:
+    """
+    من الـ Google Sheet — بيبني دكشنري:
+      competition_id (str) → [sofascore_tournament_id, ...]
+    بيدعم علاقة many-to-many (بطولة عندك → أكتر من tournament في SofaScore والعكس)
+    """
+    if mapping_df.empty:
+        return {}
+
+    cols = mapping_df.columns.tolist()
+
+    # detect column names flexibly
+    comp_id_col = next((c for c in cols if 'competition_id' in c), None)
+    sf_id_col   = next((c for c in cols if 'sofascore' in c and 'id' in c), None)
+
+    if not comp_id_col or not sf_id_col:
+        return {}
+
+    result = {}
+    for _, row in mapping_df.iterrows():
+        cid = str(row[comp_id_col]).strip()
+        sid = str(row[sf_id_col]).strip()
+        if not cid or not sid or cid == 'nan' or sid == 'nan':
+            continue
+        result.setdefault(cid, set()).add(sid)
+
+    return result  # { "2": {"17"}, "11": {"8", "955"}, ... }
+
+
 def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
             competition_filter: list, fuzzy_threshold: int,
             mappings: dict, exclude_cancelled: bool,
             tz_offset: int = 0,
-            tracked_comp_ids: set = None) -> pd.DataFrame:
+            tracked_comp_ids: set = None,
+            sf_mapping: dict = None) -> pd.DataFrame:
     """
-    competition_filter  : أسماء البطولات المختارة من ملف الماتشات (لفلترة DB)
+    competition_filter  : أسماء البطولات المختارة من ملف الماتشات
     tracked_comp_ids    : set of competition_id من competitions_2026.csv
-                          بيحدد بدقة 100% إيه اللي يطلع "ناقص في DB"
+    sf_mapping          : dict من build_sf_mapping — competition_id → {sofascore_tournament_ids}
     """
 
     # ── Normalize dates ───────────────────────────────────────────────────────
@@ -268,7 +324,6 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
     db_df["match_date"] = db_df["match_date"].apply(safe_date)
     sf_df["match_date"] = sf_df["match_date"].apply(safe_date)
 
-    # ── Apply timezone offset to SofaScore times ─────────────────────────────
     if tz_offset != 0:
         sf_df = apply_tz_offset(sf_df, tz_offset)
 
@@ -277,28 +332,23 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
     if exclude_cancelled and "match_play_status" in db_df.columns:
         db_df = db_df[db_df["match_play_status"].str.lower() != "cancelled"].copy()
 
-    # Build set of competition_ids that exist in our filtered DB rows
-    # هنستخدمه للـ "ناقص في DB" — بس نطلع ماتشات من بطولات عندنا فعلاً
-    db_comp_ids_in_filter = set()
-    if "competition_id" in db_df.columns:
-        db_comp_ids_in_filter = set(db_df["competition_id"].dropna().astype(str).unique())
+    # ── Build SF tournament ID whitelist from mapping ─────────────────────────
+    # لو عندنا sf_mapping: نفلتر sf_df على البطولات المرتبطة ببطولاتنا فقط
+    sf_allowed_ids = None
+    if sf_mapping and "competition_id" in db_df.columns:
+        sf_allowed_ids = set()
+        for cid in db_df["competition_id"].dropna().astype(str).unique():
+            sf_allowed_ids.update(sf_mapping.get(cid, set()))
 
-    # Final whitelist for "missing in DB" = tracked IDs ∩ DB IDs in selected filter
-    if tracked_comp_ids:
-        final_tracked_ids = {str(i) for i in tracked_comp_ids} & db_comp_ids_in_filter \
-            if db_comp_ids_in_filter else {str(i) for i in tracked_comp_ids}
-    else:
-        final_tracked_ids = db_comp_ids_in_filter
-
-    results = []
-    sf_matched = set()
-
-    # Build competition_id → name map from DB for reverse lookup
+    # Build competition_id → name map
     comp_id_to_name = {}
     if "competition_id" in db_df.columns and "competition" in db_df.columns:
         comp_id_to_name = dict(
             zip(db_df["competition_id"].astype(str), db_df["competition"])
         )
+
+    results = []
+    sf_matched = set()
 
     for _, db in db_df.iterrows():
         db_date = str(db.get("match_date", ""))
@@ -395,59 +445,62 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
             })
 
     # ── SofaScore matches not in DB ───────────────────────────────────────────
-    # فقط نطلع ماتشات من بطولات عندنا في الـ 404 — بنعرفها من competition_id
-    # SofaScore مش عنده competition_id بتاعنا، فبنعمل fuzzy match على الاسم
-    # بس بنقارن مع البطولات اللي في الـ filtered DB فقط — مش كل الـ 404
-
-    # Build lookup: DB competition name (lower) → competition_id
-    db_name_to_id = {}
-    for cid, cname in comp_id_to_name.items():
-        db_name_to_id[cname.lower().strip()] = cid
-
-    # Names of selected DB competitions for matching
+    db_name_to_id = {cname.lower().strip(): cid for cid, cname in comp_id_to_name.items()}
     selected_db_comp_names = list(comp_id_to_name.values())
 
     for idx, sf in sf_df.iterrows():
         if idx in sf_matched:
             continue
 
-        sf_tourn = str(sf.get("tournament", ""))
-        sf_cat   = str(sf.get("category", ""))
+        sf_tourn    = str(sf.get("tournament", ""))
+        sf_cat      = str(sf.get("category", ""))
+        sf_tourn_id = str(sf.get("sofascore_id", ""))  # قد يكون فيه tournament_id
 
-        # Must match one of our selected DB competitions with high confidence
-        if not selected_db_comp_names:
-            continue
+        # ── لو عندنا mapping دقيق: استخدمه ──────────────────────────────────
+        if sf_allowed_ids is not None:
+            # SofaScore data من الـ Tampermonkey script مش فيها tournament_id منفصل
+            # بنعمل fuzzy match على اسم البطولة بس نقارن مع البطولات في الـ mapping فقط
+            if not selected_db_comp_names:
+                continue
+            best = process.extractOne(
+                sf_tourn.lower(),
+                [c.lower() for c in selected_db_comp_names],
+                scorer=fuzz.token_sort_ratio,
+            )
+            # لو عندنا mapping: threshold 85% عشان ماتشات دقيقة بس
+            if not best or best[1] < 85:
+                continue
+        else:
+            # ── Fallback: fuzzy بدون mapping ────────────────────────────────
+            if not selected_db_comp_names:
+                continue
+            best = process.extractOne(
+                sf_tourn.lower(),
+                [c.lower() for c in selected_db_comp_names],
+                scorer=fuzz.token_sort_ratio,
+            )
+            if not best or best[1] < 82:
+                continue
 
-        best = process.extractOne(
-            sf_tourn.lower(),
-            [c.lower() for c in selected_db_comp_names],
-            scorer=fuzz.token_sort_ratio,
-        )
-
-        # High threshold: 82% — only flag if we're very confident it's our competition
-        if not best or best[1] < 82:
-            continue
-
-        # Extra check: reject if SF tournament name is clearly different country/context
-        # e.g. "FA Trophy" should not match "FA Women's League Cup"
         matched_db_name = selected_db_comp_names[
             [c.lower() for c in selected_db_comp_names].index(best[0])
         ]
+        matched_comp_id = db_name_to_id.get(matched_db_name.lower().strip(), "")
 
         results.append({
             "status": "🔴 ناقص في DB",
             "match_date": str(sf["match_date"]),
-            "competition": matched_db_name,   # اسم البطولة من DB مش من SofaScore
+            "competition": matched_db_name,
             "home_team": str(sf["home_team"]),
             "away_team": str(sf["away_team"]),
             "db_kickoff": "",
             "sf_kickoff": str(sf.get("kick_off_time", ""))[:5],
             "time_diff_min": None,
-            "match_score": best[1],           # نسبة التطابق على الاسم
+            "match_score": best[1],
             "db_id": "",
             "home_team_id": "",
             "away_team_id": "",
-            "competition_id": db_name_to_id.get(matched_db_name.lower().strip(), ""),
+            "competition_id": matched_comp_id,
             "sf_home": str(sf["home_team"]),
             "sf_away": str(sf["away_team"]),
             "sf_tournament": sf_tourn,
@@ -500,7 +553,26 @@ with st.sidebar:
     exclude_cancelled = st.checkbox("استبعاد Cancelled", value=True)
 
     st.divider()
-    st.caption("💡 جيب بيانات SofaScore عن طريق الـ Tampermonkey script وارفعها في الصفحة الرئيسية")
+    st.subheader("🗺️ Competition Mapping")
+    st.caption("بيجيب الـ mapping من Google Sheet تلقائياً")
+
+    mapping_df = pd.DataFrame()
+    sf_mapping = {}
+
+    if st.button("🔄 تحديث الـ Mapping", use_container_width=True):
+        st.cache_data.clear()
+
+    with st.spinner("جلب الـ mapping..."):
+        mapping_df, mapping_err = load_mapping_from_sheet(SHEET_ID)
+
+    if mapping_err:
+        st.error(f"❌ {mapping_err}")
+    elif not mapping_df.empty:
+        sf_mapping = build_sf_mapping(mapping_df)
+        mapped_count = sum(len(v) for v in sf_mapping.values())
+        st.success(f"✅ {len(sf_mapping)} بطولة مربوطة ({mapped_count} tournament IDs)")
+    else:
+        st.warning("⚠️ الـ mapping فاضي")
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_main, tab_mapping, tab_help = st.tabs(["📊 المقارنة", "🔗 Name Mapping", "❓ مساعدة"])
@@ -747,6 +819,7 @@ with tab_main:
                     exclude_cancelled,
                     tz_offset=tz_offset,
                     tracked_comp_ids=tracked_comp_ids,
+                    sf_mapping=sf_mapping,
                 )
 
             if result_df.empty:
