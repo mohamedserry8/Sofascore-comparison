@@ -342,7 +342,7 @@ def apply_tz_offset(df: pd.DataFrame, offset_hours: int) -> pd.DataFrame:
     return df.apply(shift_row, axis=1)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def load_team_mapping_from_sheet(sheet_id: str) -> tuple[dict, str]:
     """
     Load team name mapping by scanning sheet tabs for the right columns.
@@ -1021,12 +1021,17 @@ with tab_main:
                         comp_df["competition_id"].dropna().astype(str).unique()
                     )
 
-                # Merge: session mappings + sheet team mappings + defaults
+                # Load team mapping fresh at compare time (not from session state)
+                team_map_live, _gid = load_team_mapping_from_sheet(SHEET_ID)
+
                 combined_mappings = {
                     **DEFAULT_MAPPINGS,
                     **st.session_state.get("mappings", {}),
-                    **st.session_state.get("team_map_sheet", {}),
+                    **team_map_live,
                 }
+
+                st.caption(f"🔗 mappings مفعّلة: {len(combined_mappings)} "
+                           f"(منها {len(team_map_live)} من الـ Sheet)")
 
                 result_df = compare(
                     db_filtered, sf_df, selected_comps,
