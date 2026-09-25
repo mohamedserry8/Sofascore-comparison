@@ -201,9 +201,26 @@ def normalize(name: str, mappings: dict) -> str:
     return n.lower().strip()
 
 
+def safe_date(val) -> str:
+    """Parse any date format and return YYYY-MM-DD."""
+    try:
+        return pd.to_datetime(str(val), dayfirst=False).strftime("%Y-%m-%d")
+    except Exception:
+        try:
+            return pd.to_datetime(str(val), dayfirst=True).strftime("%Y-%m-%d")
+        except Exception:
+            return str(val)
+
+
 def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
             competition_filter: list, fuzzy_threshold: int,
             mappings: dict, exclude_cancelled: bool) -> pd.DataFrame:
+
+    # ── Normalize dates in both dataframes ───────────────────────────────────
+    db_df = db_df.copy()
+    sf_df = sf_df.copy()
+    db_df["match_date"] = db_df["match_date"].apply(safe_date)
+    sf_df["match_date"] = sf_df["match_date"].apply(safe_date)
 
     if competition_filter:
         db_df = db_df[db_df["competition"].isin(competition_filter)].copy()
@@ -217,12 +234,14 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
         db_date = str(db.get("match_date", ""))
         db_home = str(db.get("home_team", ""))
         db_away = str(db.get("away_team", ""))
+        db_comp = str(db.get("competition", ""))
         db_kick = str(db.get("kick_off_time", ""))[:5]
 
         db_home_n = normalize(db_home, mappings)
         db_away_n = normalize(db_away, mappings)
+        db_comp_n = db_comp.lower().strip()
 
-        # Candidate dates ±1
+        # Candidate dates ±1 day
         try:
             d = datetime.strptime(db_date, "%Y-%m-%d")
             cand_dates = [(d + timedelta(days=x)).strftime("%Y-%m-%d") for x in (-1, 0, 1)]
@@ -235,8 +254,18 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
         for idx, sf in candidates.iterrows():
             sf_home_n = normalize(str(sf["home_team"]), {})
             sf_away_n = normalize(str(sf["away_team"]), {})
-            score = (fuzz.token_sort_ratio(db_home_n, sf_home_n) +
-                     fuzz.token_sort_ratio(db_away_n, sf_away_n)) / 2
+            sf_tourn_n = str(sf.get("tournament", "")).lower().strip()
+
+            # Teams score (weight 70%)
+            teams_score = (fuzz.token_sort_ratio(db_home_n, sf_home_n) +
+                           fuzz.token_sort_ratio(db_away_n, sf_away_n)) / 2
+
+            # Competition boost (weight 30%) — helps avoid wrong tournament matches
+            comp_score = fuzz.token_sort_ratio(db_comp_n, sf_tourn_n)
+
+            # Combined: 70% teams + 30% competition
+            score = teams_score * 0.70 + comp_score * 0.30
+
             if score > best_score:
                 best_score, best_idx = score, idx
 
@@ -256,48 +285,77 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
 
             status = "⏱ فرق كيك أوف" if (time_diff is not None and abs(time_diff) > 2) else "✓ متطابق"
             results.append({
-                "status": status, "match_date": db_date,
-                "competition": str(db.get("competition", "")),
-                "home_team": db_home, "away_team": db_away,
-                "db_kickoff": db_kick, "sf_kickoff": sf_kick,
-                "time_diff_min": time_diff, "match_score": round(best_score),
-                "db_id": db.get("id", ""), "home_team_id": db.get("home_team_id", ""),
-                "away_team_id": db.get("away_team_id", ""), "competition_id": db.get("competition_id", ""),
-                "sf_home": sf["home_team"], "sf_away": sf["away_team"],
+                "status": status,
+                "match_date": db_date,
+                "competition": db_comp,
+                "home_team": db_home,
+                "away_team": db_away,
+                "db_kickoff": db_kick,
+                "sf_kickoff": sf_kick,
+                "time_diff_min": time_diff,
+                "match_score": round(best_score),
+                "db_id": db.get("id", ""),
+                "home_team_id": db.get("home_team_id", ""),
+                "away_team_id": db.get("away_team_id", ""),
+                "competition_id": db.get("competition_id", ""),
+                "sf_home": sf["home_team"],
+                "sf_away": sf["away_team"],
                 "sf_tournament": sf.get("tournament", ""),
+                "sf_category": sf.get("category", ""),
             })
         else:
             results.append({
-                "status": "🟡 مش في SofaScore", "match_date": db_date,
-                "competition": str(db.get("competition", "")),
-                "home_team": db_home, "away_team": db_away,
-                "db_kickoff": db_kick, "sf_kickoff": "",
-                "time_diff_min": None, "match_score": round(best_score),
-                "db_id": db.get("id", ""), "home_team_id": db.get("home_team_id", ""),
-                "away_team_id": db.get("away_team_id", ""), "competition_id": db.get("competition_id", ""),
-                "sf_home": "", "sf_away": "", "sf_tournament": "",
+                "status": "🟡 مش في SofaScore",
+                "match_date": db_date,
+                "competition": db_comp,
+                "home_team": db_home,
+                "away_team": db_away,
+                "db_kickoff": db_kick,
+                "sf_kickoff": "",
+                "time_diff_min": None,
+                "match_score": round(best_score),
+                "db_id": db.get("id", ""),
+                "home_team_id": db.get("home_team_id", ""),
+                "away_team_id": db.get("away_team_id", ""),
+                "competition_id": db.get("competition_id", ""),
+                "sf_home": "",
+                "sf_away": "",
+                "sf_tournament": "",
+                "sf_category": "",
             })
 
-    # Matches in SofaScore not in DB
+    # SofaScore matches not matched to any DB row
     for idx, sf in sf_df.iterrows():
         if idx in sf_matched:
             continue
         sf_tourn = str(sf.get("tournament", ""))
+        sf_cat   = str(sf.get("category", ""))
         if competition_filter:
-            best = process.extractOne(sf_tourn.lower(),
-                                      [c.lower() for c in competition_filter],
-                                      scorer=fuzz.token_sort_ratio)
+            best = process.extractOne(
+                sf_tourn.lower(),
+                [c.lower() for c in competition_filter],
+                scorer=fuzz.token_sort_ratio,
+            )
             if not best or best[1] < 60:
                 continue
         results.append({
-            "status": "🔴 ناقص في DB", "match_date": str(sf["match_date"]),
+            "status": "🔴 ناقص في DB",
+            "match_date": str(sf["match_date"]),
             "competition": sf_tourn,
-            "home_team": str(sf["home_team"]), "away_team": str(sf["away_team"]),
-            "db_kickoff": "", "sf_kickoff": str(sf.get("kick_off_time", ""))[:5],
-            "time_diff_min": None, "match_score": 0,
-            "db_id": "", "home_team_id": "", "away_team_id": "", "competition_id": "",
-            "sf_home": str(sf["home_team"]), "sf_away": str(sf["away_team"]),
+            "home_team": str(sf["home_team"]),
+            "away_team": str(sf["away_team"]),
+            "db_kickoff": "",
+            "sf_kickoff": str(sf.get("kick_off_time", ""))[:5],
+            "time_diff_min": None,
+            "match_score": 0,
+            "db_id": "",
+            "home_team_id": "",
+            "away_team_id": "",
+            "competition_id": "",
+            "sf_home": str(sf["home_team"]),
+            "sf_away": str(sf["away_team"]),
             "sf_tournament": sf_tourn,
+            "sf_category": sf_cat,
         })
 
     return pd.DataFrame(results) if results else pd.DataFrame()
@@ -537,21 +595,50 @@ with tab_main:
         if "result_df" in st.session_state and not st.session_state.result_df.empty:
             result_df = st.session_state.result_df
             counts = result_df["status"].value_counts()
+            total  = len(result_df)
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("🔴 ناقص في DB", counts.get("🔴 ناقص في DB", 0))
-            c2.metric("🟡 مش في SofaScore", counts.get("🟡 مش في SofaScore", 0))
-            c3.metric("⏱ فرق كيك أوف", counts.get("⏱ فرق كيك أوف", 0))
-            c4.metric("✓ متطابق", counts.get("✓ متطابق", 0))
+            n_miss  = counts.get("🔴 ناقص في DB", 0)
+            n_extra = counts.get("🟡 مش في SofaScore", 0)
+            n_time  = counts.get("⏱ فرق كيك أوف", 0)
+            n_ok    = counts.get("✓ متطابق", 0)
+            pct_ok  = round(n_ok / total * 100) if total else 0
+
+            # ── Metrics row ──────────────────────────────────────────────────
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("🔴 ناقص في DB",       n_miss,
+                      help="موجود على SofaScore مش موجود عندك")
+            c2.metric("🟡 مش في SofaScore",  n_extra,
+                      help="موجود عندك مش لاقيه على SofaScore")
+            c3.metric("⏱ فرق كيك أوف",      n_time,
+                      help="الماتش متطابق بس الوقت مختلف")
+            c4.metric("✓ متطابق",            n_ok)
+            c5.metric("نسبة التطابق",        f"{pct_ok}%",
+                      delta=f"{n_ok} من {total}",
+                      delta_color="normal")
+
+            # ── Match accuracy bar ───────────────────────────────────────────
+            st.progress(pct_ok / 100,
+                        text=f"دقة المطابقة: {pct_ok}% ({n_ok} متطابق من {total} ماتش)")
 
             st.divider()
 
-            f1, f2, f3, f4 = st.columns([2, 2, 2, 1])
-            search = f1.text_input("🔍 بحث بالفريق", placeholder="اسم الفريق...")
-            status_f = f2.multiselect("الحالة", result_df["status"].unique().tolist(),
-                                      default=[s for s in result_df["status"].unique() if s != "✓ متطابق"])
-            comp_f = f3.multiselect("البطولة", sorted(result_df["competition"].unique().tolist()))
-            date_f = f4.selectbox("التاريخ", ["الكل"] + sorted(result_df["match_date"].unique().tolist()))
+            # ── Filters ──────────────────────────────────────────────────────
+            f1, f2, f3, f4, f5 = st.columns([2, 2, 2, 1, 1])
+            search   = f1.text_input("🔍 بحث", placeholder="اسم الفريق...")
+            status_f = f2.multiselect(
+                "الحالة",
+                result_df["status"].unique().tolist(),
+                default=result_df["status"].unique().tolist(),  # كل الحالات ظاهرة بالـ default
+            )
+            comp_f = f3.multiselect(
+                "البطولة",
+                sorted(result_df["competition"].unique().tolist()),
+            )
+            date_f = f4.selectbox(
+                "التاريخ",
+                ["الكل"] + sorted(result_df["match_date"].unique().tolist()),
+            )
+            min_score = f5.number_input("أدنى تطابق%", 0, 100, 0, step=5)
 
             disp = result_df.copy()
             if status_f:
@@ -561,38 +648,73 @@ with tab_main:
             if date_f != "الكل":
                 disp = disp[disp["match_date"] == date_f]
             if search:
-                mask = (disp["home_team"].str.contains(search, case=False, na=False) |
-                        disp["away_team"].str.contains(search, case=False, na=False))
+                mask = (
+                    disp["home_team"].str.contains(search, case=False, na=False) |
+                    disp["away_team"].str.contains(search, case=False, na=False) |
+                    disp["competition"].str.contains(search, case=False, na=False)
+                )
                 disp = disp[mask]
-            if not show_matched:
-                disp = disp[disp["status"] != "✓ متطابق"]
+            if min_score > 0:
+                disp = disp[disp["match_score"] >= min_score]
 
-            st.caption(f"عرض {len(disp):,} من {len(result_df):,} نتيجة")
+            st.caption(f"عرض **{len(disp):,}** من {total:,} نتيجة")
 
+            # ── Table ─────────────────────────────────────────────────────────
             st.dataframe(
-                disp[["status", "match_date", "competition", "home_team", "away_team",
-                       "db_kickoff", "sf_kickoff", "time_diff_min", "match_score", "db_id"]].rename(columns={
-                    "status": "الحالة", "match_date": "التاريخ", "competition": "البطولة",
-                    "home_team": "الهوم", "away_team": "الأواي",
-                    "db_kickoff": "كيك أوف DB", "sf_kickoff": "كيك أوف SofaScore",
-                    "time_diff_min": "فرق (دقيقة)", "match_score": "تطابق %", "db_id": "DB ID",
+                disp[[
+                    "status", "match_date", "competition",
+                    "home_team", "away_team",
+                    "db_kickoff", "sf_kickoff", "time_diff_min",
+                    "match_score", "sf_tournament", "sf_category",
+                    "db_id", "competition_id",
+                ]].rename(columns={
+                    "status":        "الحالة",
+                    "match_date":    "التاريخ",
+                    "competition":   "البطولة (DB)",
+                    "home_team":     "الهوم",
+                    "away_team":     "الأواي",
+                    "db_kickoff":    "كيك أوف DB",
+                    "sf_kickoff":    "كيك أوف SF",
+                    "time_diff_min": "فرق (د)",
+                    "match_score":   "تطابق%",
+                    "sf_tournament": "بطولة SF",
+                    "sf_category":   "دولة SF",
+                    "db_id":         "DB ID",
+                    "competition_id":"Comp ID",
                 }),
-                use_container_width=True, height=480,
+                use_container_width=True,
+                height=500,
+                column_config={
+                    "تطابق%": st.column_config.ProgressColumn(
+                        "تطابق%", min_value=0, max_value=100, format="%d%%"
+                    ),
+                    "فرق (د)": st.column_config.NumberColumn("فرق (د)", format="%+d دقيقة"),
+                },
             )
 
+            # ── Export ────────────────────────────────────────────────────────
             st.divider()
-            ec1, ec2 = st.columns(2)
-            ec1.download_button("⬇️ Export نتائج الفلتر",
-                                disp.to_csv(index=False).encode("utf-8-sig"),
-                                f"comparison_{date_from}_{date_to}.csv", "text/csv")
+            ec1, ec2, ec3 = st.columns(3)
+            ec1.download_button(
+                "⬇️ Export الفلتر الحالي",
+                disp.to_csv(index=False).encode("utf-8-sig"),
+                f"filtered_{date_from}_{date_to}.csv", "text/csv",
+            )
             problems = result_df[result_df["status"] != "✓ متطابق"]
-            ec2.download_button("🚨 Export المشاكل فقط",
-                                problems.to_csv(index=False).encode("utf-8-sig"),
-                                f"problems_{date_from}_{date_to}.csv", "text/csv")
+            ec2.download_button(
+                "🚨 Export المشاكل فقط",
+                problems.to_csv(index=False).encode("utf-8-sig"),
+                f"problems_{date_from}_{date_to}.csv", "text/csv",
+            )
+            ec3.download_button(
+                "✅ Export المتطابقات فقط",
+                result_df[result_df["status"] == "✓ متطابق"].to_csv(index=False).encode("utf-8-sig"),
+                f"matched_{date_from}_{date_to}.csv", "text/csv",
+            )
 
             with st.expander("👁️ بيانات SofaScore الخام"):
                 sf_s = st.text_input("بحث في SofaScore", key="sf_s")
-                sf_disp = st.session_state.sf_df
+                sf_disp = st.session_state.sf_df.copy()
                 if sf_s:
                     sf_disp = sf_disp[
                         sf_disp["home_team"].str.contains(sf_s, case=False, na=False) |
