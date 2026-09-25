@@ -1148,6 +1148,159 @@ with tab_main:
                 f"matched_{date_from}_{date_to}.csv", "text/csv",
             )
 
+            # ── 🔗 Mapping Builder — اقتراحات ربط تلقائية ─────────────────────
+            st.divider()
+            st.subheader("🔗 بناء الـ Team Mapping")
+            st.caption(
+                "الأداة بتقارن الماتشات الناقصة في DB مع اللي مش لاقيينها في SofaScore "
+                "وبتقترح الفرق اللي ممكن تكون نفسها. اختار الصح وانسخهم للـ Sheet."
+            )
+
+            missing_db  = result_df[result_df["status"] == "🔴 ناقص في DB"]
+            missing_sf  = result_df[result_df["status"] == "🟡 مش في SofaScore"]
+
+            if len(missing_db) == 0 or len(missing_sf) == 0:
+                st.info("مفيش mismatches محتاجة mapping — كل حاجة متطابقة ✅")
+            else:
+                suggestions = []
+
+                # For each "missing in SofaScore" DB match, find likely SF counterpart
+                for _, db_row in missing_sf.iterrows():
+                    db_date = db_row["match_date"]
+                    db_comp_id = str(db_row.get("competition_id", ""))
+                    db_h = str(db_row["home_team"])
+                    db_a = str(db_row["away_team"])
+
+                    # Candidates: same date, same competition
+                    cands = missing_db[
+                        (missing_db["match_date"] == db_date) &
+                        (missing_db["competition_id"].astype(str) == db_comp_id)
+                    ]
+
+                    for _, sf_row in cands.iterrows():
+                        sf_h = str(sf_row["home_team"])
+                        sf_a = str(sf_row["away_team"])
+
+                        # Score the pairing
+                        h_sim = max(
+                            fuzz.token_set_ratio(normalize(db_h, {}), normalize(sf_h, {})),
+                            fuzz.partial_ratio(normalize(db_h, {}), normalize(sf_h, {})),
+                        )
+                        a_sim = max(
+                            fuzz.token_set_ratio(normalize(db_a, {}), normalize(sf_a, {})),
+                            fuzz.partial_ratio(normalize(db_a, {}), normalize(sf_a, {})),
+                        )
+                        pair_score = (h_sim + a_sim) / 2
+
+                        # Same competition + same date + kickoff match = very likely same match
+                        kickoff_match = (
+                            str(db_row.get("db_kickoff", "")) == str(sf_row.get("sf_kickoff", ""))
+                            and str(db_row.get("db_kickoff", "")) != ""
+                        )
+
+                        confidence = pair_score + (25 if kickoff_match else 0)
+
+                        if confidence >= 35:   # low bar — user reviews anyway
+                            if normalize(db_h, {}) != normalize(sf_h, {}):
+                                suggestions.append({
+                                    "confidence": round(min(confidence, 100)),
+                                    "kickoff_match": "✓" if kickoff_match else "",
+                                    "competition": db_row["competition"],
+                                    "date": db_date,
+                                    "db_team_name": db_h,
+                                    "sofascore_team_name": sf_h,
+                                    "context": f"{db_h} vs {db_a}  ↔  {sf_h} vs {sf_a}",
+                                })
+                            if normalize(db_a, {}) != normalize(sf_a, {}):
+                                suggestions.append({
+                                    "confidence": round(min(confidence, 100)),
+                                    "kickoff_match": "✓" if kickoff_match else "",
+                                    "competition": db_row["competition"],
+                                    "date": db_date,
+                                    "db_team_name": db_a,
+                                    "sofascore_team_name": sf_a,
+                                    "context": f"{db_h} vs {db_a}  ↔  {sf_h} vs {sf_a}",
+                                })
+
+                if not suggestions:
+                    st.info("مفيش اقتراحات mapping واضحة للفترة دي")
+                else:
+                    sug_df = pd.DataFrame(suggestions).drop_duplicates(
+                        subset=["db_team_name", "sofascore_team_name"]
+                    ).sort_values("confidence", ascending=False)
+
+                    # Remove pairs already in the sheet mapping
+                    existing = st.session_state.get("team_map_sheet", {})
+                    sug_df = sug_df[~sug_df["db_team_name"].isin(existing.keys())]
+
+                    st.write(f"**{len(sug_df)} اقتراح ربط** — علّم ✅ على اللي صح:")
+
+                    sug_df = sug_df.reset_index(drop=True)
+                    sug_df.insert(0, "صح؟", sug_df["confidence"] >= 70)
+
+                    edited_sug = st.data_editor(
+                        sug_df[[
+                            "صح؟", "confidence", "kickoff_match",
+                            "db_team_name", "sofascore_team_name",
+                            "competition", "date", "context",
+                        ]].rename(columns={
+                            "confidence":          "ثقة%",
+                            "kickoff_match":       "نفس الوقت",
+                            "db_team_name":        "اسم DB",
+                            "sofascore_team_name": "اسم SofaScore",
+                            "competition":         "البطولة",
+                            "date":                "التاريخ",
+                            "context":             "السياق",
+                        }),
+                        use_container_width=True,
+                        height=340,
+                        disabled=["ثقة%", "نفس الوقت", "اسم DB", "اسم SofaScore",
+                                  "البطولة", "التاريخ", "السياق"],
+                        column_config={
+                            "صح؟": st.column_config.CheckboxColumn("صح؟", width="small"),
+                            "ثقة%": st.column_config.ProgressColumn(
+                                "ثقة%", min_value=0, max_value=100, format="%d%%"
+                            ),
+                        },
+                        key="sug_editor",
+                    )
+
+                    confirmed = edited_sug[edited_sug["صح؟"] == True]
+
+                    if len(confirmed) > 0:
+                        st.success(f"✅ {len(confirmed)} ربط مختار")
+
+                        out = confirmed[["اسم DB", "اسم SofaScore"]].rename(columns={
+                            "اسم DB": "db_team_name",
+                            "اسم SofaScore": "sofascore_team_name",
+                        })
+
+                        mc1, mc2 = st.columns(2)
+
+                        with mc1:
+                            st.download_button(
+                                "⬇️ تحميل CSV للـ Sheet",
+                                out.to_csv(index=False).encode("utf-8-sig"),
+                                f"team_mapping_{date_from}.csv",
+                                "text/csv",
+                                use_container_width=True,
+                            )
+
+                        with mc2:
+                            # TSV for direct paste into Google Sheets
+                            tsv = out.to_csv(index=False, sep="\t")
+                            st.text_area(
+                                "📋 انسخ ده والزقه في الـ Sheet (tab التيمز)",
+                                value=tsv,
+                                height=140,
+                            )
+
+                        st.caption(
+                            "💡 الزقهم في الـ tab التاني في الـ Google Sheet "
+                            "(الأعمدة: db_team_name | sofascore_team_name) "
+                            "وبعدين اضغط 🔄 تحديث الـ Mapping في الـ sidebar وشغّل تاني"
+                        )
+
             with st.expander("👁️ بيانات SofaScore الخام"):
                 sf_s = st.text_input("بحث في SofaScore", key="sf_s")
                 sf_disp = st.session_state.sf_df.copy()
