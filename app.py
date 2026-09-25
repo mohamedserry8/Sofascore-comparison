@@ -222,9 +222,29 @@ def parse_sofascore_csv(uploaded_file) -> tuple[pd.DataFrame, str]:
 
 # ─── Comparison engine ────────────────────────────────────────────────────────
 def normalize(name: str, mappings: dict) -> str:
+    """
+    Normalize team name for fuzzy matching.
+    Strips common suffixes/prefixes that differ between sources.
+    """
+    import re
     n = str(name).strip()
     n = mappings.get(n, n)
-    return n.lower().strip()
+    n = n.lower().strip()
+
+    # Remove common club-type words that differ between sources
+    noise = [
+        r'\bfc\b', r'\bcf\b', r'\bsc\b', r'\bac\b', r'\bafc\b', r'\bcd\b',
+        r'\bclub\b', r'\bclub atlético\b', r'\bclub atletico\b',
+        r'\bwfc\b', r'\bfk\b', r'\bsk\b', r'\bif\b', r'\bik\b',
+        r'\bunion\b', r'\bsv\b', r'\btsv\b', r'\bvfb\b', r'\bvfl\b',
+        r'\b\d{4}\b',  # years like 1907
+    ]
+    for pattern in noise:
+        n = re.sub(pattern, ' ', n)
+
+    # Collapse whitespace
+    n = re.sub(r'\s+', ' ', n).strip()
+    return n if n else str(name).lower().strip()
 
 
 def safe_date(val) -> str:
@@ -410,16 +430,25 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
             sf_home_n = normalize(str(sf["home_team"]), {})
             sf_away_n = normalize(str(sf["away_team"]), {})
 
-            teams_score = (fuzz.token_sort_ratio(db_home_n, sf_home_n) +
-                           fuzz.token_sort_ratio(db_away_n, sf_away_n)) / 2
+            # token_set_ratio handles abbreviated/extended names much better:
+            #   "KC Current" vs "Kansas City Current"       → 82%  (token_sort: 62%)
+            #   "Como 1907 W" vs "Como"                     → 100% (token_sort: 53%)
+            #   "Brighton & Hove Albion WFC" vs "Brighton"  → 100% (token_sort: 47%)
+            home_score = max(
+                fuzz.token_set_ratio(db_home_n, sf_home_n),
+                fuzz.partial_ratio(db_home_n, sf_home_n),
+            )
+            away_score = max(
+                fuzz.token_set_ratio(db_away_n, sf_away_n),
+                fuzz.partial_ratio(db_away_n, sf_away_n),
+            )
+            teams_score = (home_score + away_score) / 2
 
             if use_comp_boost:
-                # No tournament_id filter — add competition name boost (70/30)
                 sf_tourn_n = str(sf.get("tournament", "")).lower().strip()
-                comp_score = fuzz.token_sort_ratio(db_comp_n, sf_tourn_n)
+                comp_score = fuzz.token_set_ratio(db_comp_n, sf_tourn_n)
                 score = teams_score * 0.70 + comp_score * 0.30
             else:
-                # Tournament already filtered by ID — only match on teams (100%)
                 score = teams_score
 
             if score > best_score:
