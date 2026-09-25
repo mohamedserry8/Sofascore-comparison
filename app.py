@@ -212,15 +212,59 @@ def safe_date(val) -> str:
             return str(val)
 
 
+def apply_tz_offset(df: pd.DataFrame, offset_hours: int) -> pd.DataFrame:
+    """
+    Shift kick_off_time in SofaScore data by offset_hours to convert UTC → local.
+    Also adjusts match_date when time crosses midnight.
+    """
+    if offset_hours == 0:
+        return df
+    df = df.copy()
+
+    def shift_row(row):
+        t = str(row.get("kick_off_time", ""))[:5]
+        d = str(row.get("match_date", ""))
+        if not t or len(t) < 5 or ":" not in t:
+            return row
+        try:
+            h, m = int(t[:2]), int(t[3:5])
+            total_min = h * 60 + m + offset_hours * 60
+            # Handle day crossover
+            day_shift = total_min // (24 * 60)
+            total_min = total_min % (24 * 60)
+            if total_min < 0:
+                total_min += 24 * 60
+                day_shift -= 1
+            new_h = total_min // 60
+            new_m = total_min % 60
+            row["kick_off_time"] = f"{new_h:02d}:{new_m:02d}"
+            if day_shift != 0:
+                try:
+                    new_date = datetime.strptime(d, "%Y-%m-%d") + timedelta(days=day_shift)
+                    row["match_date"] = new_date.strftime("%Y-%m-%d")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return row
+
+    return df.apply(shift_row, axis=1)
+
+
 def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
             competition_filter: list, fuzzy_threshold: int,
-            mappings: dict, exclude_cancelled: bool) -> pd.DataFrame:
+            mappings: dict, exclude_cancelled: bool,
+            tz_offset: int = 0) -> pd.DataFrame:
 
     # ── Normalize dates in both dataframes ───────────────────────────────────
     db_df = db_df.copy()
     sf_df = sf_df.copy()
     db_df["match_date"] = db_df["match_date"].apply(safe_date)
     sf_df["match_date"] = sf_df["match_date"].apply(safe_date)
+
+    # ── Apply timezone offset to SofaScore times ─────────────────────────────
+    if tz_offset != 0:
+        sf_df = apply_tz_offset(sf_df, tz_offset)
 
     if competition_filter:
         db_df = db_df[db_df["competition"].isin(competition_filter)].copy()
@@ -391,9 +435,17 @@ with st.sidebar:
     fuzzy_threshold = st.slider("Fuzzy Match %", 50, 100, 78)
 
     st.divider()
+    st.subheader("🕐 فارق التوقيت")
+    tz_offset = st.number_input(
+        "SofaScore UTC → توقيتك (ساعات)",
+        min_value=-12, max_value=14, value=3, step=1,
+        help="القاهرة = +3 | لو SofaScore بيكسب 3 ساعات عن DB بتاعك، اكتب 3"
+    )
+    st.caption(f"SofaScore 21:30 → عندك {(21 + tz_offset) % 24:02d}:30" if tz_offset else "مفيش تعديل على التوقيت")
+
+    st.divider()
     st.subheader("🔧 خيارات")
     exclude_cancelled = st.checkbox("استبعاد Cancelled", value=True)
-    show_matched = st.checkbox("إظهار المتطابقات", value=False)
 
     st.divider()
     st.caption("💡 جيب بيانات SofaScore عن طريق الـ Tampermonkey script وارفعها في الصفحة الرئيسية")
@@ -586,6 +638,7 @@ with tab_main:
                     fuzzy_threshold,
                     st.session_state.get("mappings", DEFAULT_MAPPINGS),
                     exclude_cancelled,
+                    tz_offset=tz_offset,
                 )
 
             st.session_state.result_df = result_df
