@@ -562,44 +562,61 @@ with tab_main:
     st.divider()
 
     if comp_df is not None and db_df is not None:
-        # Competition selector
-        all_comps = sorted(comp_df["competition"].dropna().unique().tolist()) \
-            if "competition" in comp_df.columns \
-            else sorted(db_df["competition"].dropna().unique().tolist())
 
         st.subheader("🏆 اختار البطولات")
+        st.caption("الأسماء دي من ملف الماتشات بتاعك مباشرة — مضمون التطابق 100%")
 
+        # ── Always use DB match file for competition names (exact match guaranteed)
+        db_comps_all = sorted(db_df["competition"].dropna().unique().tolist())
+
+        # Optional: filter by country using the competitions file
         country_opts = []
         if comp_df is not None and "competition_country" in comp_df.columns:
             country_opts = sorted(comp_df["competition_country"].dropna().unique().tolist())
 
         c1, c2, c3 = st.columns([3, 1, 1])
         with c1:
-            country_filter = st.multiselect("فلتر بالدولة", options=country_opts, placeholder="كل الدول")
+            country_filter = st.multiselect(
+                "فلتر بالدولة (اختياري)",
+                options=country_opts,
+                placeholder="كل الدول"
+            )
         with c2:
             sel_all = st.button("✅ الكل")
         with c3:
             clr_all = st.button("❌ مسح")
 
-        filtered_comps = all_comps
+        # Filter DB comps by country if selected
         if country_filter and comp_df is not None and "competition_country" in comp_df.columns:
-            filtered_comps = comp_df[comp_df["competition_country"].isin(country_filter)]["competition"].dropna().unique().tolist()
+            comps_in_country = comp_df[
+                comp_df["competition_country"].isin(country_filter)
+            ]["competition"].dropna().unique().tolist()
+            # Match against actual DB comp names using fuzzy
+            filtered_comps = []
+            for db_comp in db_comps_all:
+                best = process.extractOne(
+                    db_comp.lower(),
+                    [c.lower() for c in comps_in_country],
+                    scorer=fuzz.token_sort_ratio,
+                )
+                if best and best[1] >= 70:
+                    filtered_comps.append(db_comp)
+        else:
+            filtered_comps = db_comps_all
 
-        if "selected_comps" not in st.session_state:
-            st.session_state.selected_comps = filtered_comps[:20]
-        if sel_all:
+        if "selected_comps" not in st.session_state or sel_all:
             st.session_state.selected_comps = filtered_comps
         if clr_all:
             st.session_state.selected_comps = []
 
         selected_comps = st.multiselect(
-            f"البطولات ({len(filtered_comps)} متاحة)",
+            f"البطولات ({len(filtered_comps)} متاحة من ملف الماتشات)",
             options=filtered_comps,
             default=[c for c in st.session_state.selected_comps if c in filtered_comps],
-            key="comp_sel"
+            key="comp_sel",
         )
         st.session_state.selected_comps = selected_comps
-        st.caption(f"محدد: {len(selected_comps)} بطولة")
+        st.caption(f"محدد: {len(selected_comps)} من {len(db_comps_all)} بطولة")
 
         st.divider()
 
