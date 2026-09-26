@@ -527,24 +527,23 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
 
         candidates = sf_df[sf_df["match_date"].isin(cand_dates)]
         best_score, best_idx = 0, None
+        best_swapped = False
 
         for idx, sf in candidates.iterrows():
             sf_home_n = normalize(str(sf["home_team"]), {})
             sf_away_n = normalize(str(sf["away_team"]), {})
 
-            # token_set_ratio handles abbreviated/extended names much better:
-            #   "KC Current" vs "Kansas City Current"       → 82%  (token_sort: 62%)
-            #   "Como 1907 W" vs "Como"                     → 100% (token_sort: 53%)
-            #   "Brighton & Hove Albion WFC" vs "Brighton"  → 100% (token_sort: 47%)
-            home_score = max(
-                fuzz.token_set_ratio(db_home_n, sf_home_n),
-                fuzz.partial_ratio(db_home_n, sf_home_n),
-            )
-            away_score = max(
-                fuzz.token_set_ratio(db_away_n, sf_away_n),
-                fuzz.partial_ratio(db_away_n, sf_away_n),
-            )
-            teams_score = (home_score + away_score) / 2
+            def sim(a, b):
+                return max(fuzz.token_set_ratio(a, b), fuzz.partial_ratio(a, b))
+
+            # Normal orientation: home↔home, away↔away
+            normal = (sim(db_home_n, sf_home_n) + sim(db_away_n, sf_away_n)) / 2
+
+            # Swapped orientation: sources sometimes disagree on who is home
+            swapped = (sim(db_home_n, sf_away_n) + sim(db_away_n, sf_home_n)) / 2
+
+            teams_score = max(normal, swapped)
+            is_swapped  = swapped > normal
 
             if use_comp_boost:
                 sf_tourn_n = str(sf.get("tournament", "")).lower().strip()
@@ -555,6 +554,7 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
 
             if score > best_score:
                 best_score, best_idx = score, idx
+                best_swapped = is_swapped
 
         if best_idx is not None and best_score >= fuzzy_threshold:
             sf = sf_df.loc[best_idx]
@@ -571,6 +571,8 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
                 pass
 
             status = "⏱ فرق كيك أوف" if (time_diff is not None and abs(time_diff) > 2) else "✓ متطابق"
+            if best_swapped:
+                status = "🔄 الهوم/أواي معكوس" if status == "✓ متطابق" else status + " + معكوس"
             results.append({
                 "status": status,
                 "match_date": db_date,
@@ -771,6 +773,19 @@ with st.sidebar:
         if team_map_sheet:
             st.info(f"🔗 {len(team_map_sheet)} فريق مربوط يدوياً")
         st.session_state.team_map_sheet = team_map_sheet
+
+        with st.expander("🎯 IDs للـ Targeted Exporter"):
+            all_sf_ids = sorted(
+                {i for ids in sf_mapping.values() for i in ids},
+                key=lambda x: int(x) if x.isdigit() else 0
+            )
+            st.caption(f"{len(all_sf_ids)} tournament ID — الزقهم في الـ Tampermonkey script")
+            st.text_area(
+                "انسخ من هنا",
+                value=", ".join(all_sf_ids),
+                height=110,
+                key="sf_ids_out",
+            )
 
         with st.expander("🔍 Debug الـ mapping"):
             st.write("**أعمدة Master:**", mapping_df.columns.tolist())
