@@ -476,26 +476,14 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
     if exclude_cancelled and "match_play_status" in db_df.columns:
         db_df = db_df[db_df["match_play_status"].str.lower() != "cancelled"].copy()
 
-    # ── Build SF tournament ID whitelist from mapping ─────────────────────────
-    sf_allowed_ids = None
-    use_comp_boost = True  # whether to include competition score in fuzzy
-
-    if sf_mapping and "competition_id" in db_df.columns:
-        sf_allowed_ids = set()
-        for cid in db_df["competition_id"].dropna().astype(str).unique():
-            cid_clean = str(int(float(cid))) if cid.replace('.','').isdigit() else cid
-            sf_allowed_ids.update(sf_mapping.get(cid_clean, set()))
-
-    # ── Filter sf_df by tournament_id if available ────────────────────────────
+    # ── SF tournament ID whitelist, per competition_id ────────────────────────
     sf_tid_col = next((c for c in sf_df.columns if c == 'tournament_id'), None)
+    have_tid   = sf_tid_col is not None and bool(sf_mapping)
 
-    if sf_allowed_ids and sf_tid_col:
-        sf_df_filtered = sf_df[
-            sf_df[sf_tid_col].astype(str).str.replace('.0','',regex=False).isin(sf_allowed_ids)
-        ].copy()
-        if len(sf_df_filtered) > 0:
-            sf_df = sf_df_filtered
-            use_comp_boost = False  # tournament already matched — only fuzzy on teams now
+    if have_tid:
+        # Normalized tournament_id column for fast lookups
+        sf_df["_tid"] = (sf_df[sf_tid_col].astype(str)
+                         .str.replace('.0', '', regex=False).str.strip())
 
     # Build competition_id → name map
     comp_id_to_name = {}
@@ -526,6 +514,20 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
             cand_dates = [db_date]
 
         candidates = sf_df[sf_df["match_date"].isin(cand_dates)]
+
+        # ── Restrict to THIS competition's mapped SofaScore tournaments ───────
+        db_cid = str(db.get("competition_id", "")).strip()
+        if db_cid.replace('.', '').isdigit():
+            db_cid = str(int(float(db_cid)))
+
+        row_allowed_ids = sf_mapping.get(db_cid, set()) if sf_mapping else set()
+        use_comp_boost = True
+
+        if have_tid and row_allowed_ids:
+            candidates = candidates[candidates["_tid"].isin(row_allowed_ids)]
+            # Tournament is guaranteed correct now — score teams only
+            use_comp_boost = False
+
         best_score, best_idx = 0, None
         best_swapped = False
 
