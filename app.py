@@ -471,6 +471,41 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
     if tz_offset != 0:
         sf_df = apply_tz_offset(sf_df, tz_offset)
 
+    # ── Drop duplicate SofaScore rows for the same real-world match ──────────
+    # SofaScore can return the same fixture under two event ids (e.g. a cached
+    # "Not started" copy plus a live "2nd half" copy). Without this, the second
+    # copy stays unmatched and is wrongly reported as "missing in DB".
+    if len(sf_df):
+        _key_cols = ["match_date", "home_team", "away_team"]
+        if "tournament_id" in sf_df.columns:
+            _key_cols.append("tournament_id")
+
+        sf_df["_dupkey"] = (
+            sf_df[_key_cols].astype(str)
+            .apply(lambda r: "|".join(v.strip().lower() for v in r), axis=1)
+        )
+
+        # Prefer the row with the most informative status (live/finished over
+        # "not started"), so kickoff times reflect the latest known value.
+        _status_rank = {
+            "not started": 0, "postponed": 0, "canceled": 0, "cancelled": 0,
+        }
+        sf_df["_rank"] = (
+            sf_df.get("status", pd.Series([""] * len(sf_df), index=sf_df.index))
+            .astype(str).str.strip().str.lower().map(_status_rank).fillna(1)
+        )
+
+        n_before = len(sf_df)
+        sf_df = (sf_df.sort_values("_rank", ascending=False)
+                      .drop_duplicates(subset="_dupkey", keep="first")
+                      .drop(columns=["_dupkey", "_rank"]))
+        n_dupes = n_before - len(sf_df)
+
+        try:
+            st.session_state.sf_dupes_removed = n_dupes
+        except Exception:
+            pass
+
     if competition_filter:
         db_df = db_df[db_df["competition"].isin(competition_filter)].copy()
     if exclude_cancelled and "match_play_status" in db_df.columns:
@@ -1151,7 +1186,6 @@ with tab_main:
 
                 st.caption(f"🔗 mappings مفعّلة: {len(combined_mappings)} "
                            f"(منها {len(team_map_live)} من الـ Sheet)")
-
                 result_df = compare(
                     db_filtered, sf_df, selected_comps,
                     fuzzy_threshold,
@@ -1197,6 +1231,11 @@ with tab_main:
 </span>
 </div>
 """, unsafe_allow_html=True)
+
+            n_dupes_removed = st.session_state.get("sf_dupes_removed", 0)
+            if n_dupes_removed:
+                st.caption(f"🧹 اتشال {n_dupes_removed} صف مكرر من داتا SofaScore "
+                           f"(نفس الماتش برجع بأكتر من event id)")
 
             # ── Metrics row ──────────────────────────────────────────────────
             c1, c2, c3, c4, c5 = st.columns(5)
