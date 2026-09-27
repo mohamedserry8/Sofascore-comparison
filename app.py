@@ -214,6 +214,10 @@ def parse_sofascore_csv(uploaded_file) -> tuple[pd.DataFrame, str]:
             df["tournament"] = ""
 
         df["kick_off_time"] = df["kick_off_time"].astype(str).str[:5]
+
+        # Newer exporter versions already convert to the user's local time and
+        # record it in a marker column. Flag it so the app doesn't shift again.
+        df.attrs["already_local"] = "tz_applied" in df.columns
         return df, ""
 
     except Exception as ex:
@@ -1065,6 +1069,18 @@ with tab_main:
                 st.warning("⚠️ مفيش بيانات SofaScore")
                 st.stop()
 
+            # The newer exporter writes local time already — applying the
+            # sidebar offset again would double-shift every kickoff.
+            already_local = "tz_applied" in sf_df.columns
+            effective_tz  = 0 if already_local else tz_offset
+
+            if already_local and tz_offset != 0:
+                st.info(
+                    f"ℹ️ الملف ده متحوّل لتوقيتك المحلي من الـ script "
+                    f"(tz_applied) — فتم تجاهل فارق التوقيت ({tz_offset:+d}) "
+                    f"عشان ما يتطبقش مرتين."
+                )
+
             # ── Filter DB by date range ───────────────────────────────────────
             db_filtered = db_df[
                 (db_df["match_date"] >= date_from.strftime("%Y-%m-%d")) &
@@ -1191,7 +1207,7 @@ with tab_main:
                     fuzzy_threshold,
                     combined_mappings,
                     exclude_cancelled,
-                    tz_offset=tz_offset,
+                    tz_offset=effective_tz,
                     tracked_comp_ids=tracked_comp_ids,
                     sf_mapping=sf_mapping,
                 )
