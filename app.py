@@ -494,6 +494,7 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
 
     results = []
     sf_matched = set()
+    diag_unmatched = []   # rows that found zero candidates — surfaced in Debug
 
     for _, db in db_df.iterrows():
         db_date = str(db.get("match_date", ""))
@@ -527,6 +528,25 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
             candidates = candidates[candidates["_tid"].isin(row_allowed_ids)]
             # Tournament is guaranteed correct now — score teams only
             use_comp_boost = False
+        elif have_tid and not row_allowed_ids:
+            # Competition has no mapping → fall back to fuzzy on name too
+            use_comp_boost = True
+
+        # Record why a row found no candidates (for the diagnostics table)
+        if len(candidates) == 0:
+            same_date = sf_df[sf_df["match_date"].isin(cand_dates)]
+            diag_unmatched.append({
+                "competition":    db_comp,
+                "competition_id": db_cid,
+                "home_team":      db_home,
+                "away_team":      db_away,
+                "match_date":     db_date,
+                "mapped_sf_ids":  ", ".join(sorted(row_allowed_ids)) if row_allowed_ids else "— مفيش mapping",
+                "sf_on_that_date": len(same_date),
+                "sf_tids_present": ", ".join(sorted(set(same_date["_tid"]))[:12]) if have_tid and len(same_date) else "",
+                "reason": ("البطولة مش مربوطة في الـ Sheet" if not row_allowed_ids
+                           else "مفيش ماتش SofaScore بالـ tournament_id المربوط"),
+            })
 
         best_score, best_idx = 0, None
         best_swapped = False
@@ -695,6 +715,12 @@ def compare(db_df: pd.DataFrame, sf_df: pd.DataFrame,
             "sf_tournament": sf_tourn,
             "sf_category": sf_cat,
         })
+
+    # Expose diagnostics for the Debug panel
+    try:
+        st.session_state.diag_unmatched = pd.DataFrame(diag_unmatched)
+    except Exception:
+        pass
 
     return pd.DataFrame(results) if results else pd.DataFrame()
 
@@ -906,6 +932,18 @@ with tab_main:
                 st.error(f"❌ {err}")
             else:
                 st.success(f"✅ {len(sf_manual_df):,} ماتش")
+
+                if "tournament_id" not in sf_manual_df.columns:
+                    st.error(
+                        "⚠️ الملف ده مفيهوش عمود **tournament_id** — "
+                        "يبقى نسخة قديمة من الـ script.\n\n"
+                        "حدّث الـ Tampermonkey script ونزّل CSV جديد، "
+                        "وإلا المقارنة هتعتمد على أسماء البطولات بس."
+                    )
+                else:
+                    n_ids = sf_manual_df["tournament_id"].astype(str).str.strip().ne("").sum()
+                    st.caption(f"🎯 tournament_id موجود في {n_ids:,} صف")
+
                 with st.expander("معاينة SofaScore"):
                     st.dataframe(sf_manual_df.head(8), use_container_width=True)
 
@@ -1414,6 +1452,44 @@ with tab_main:
                             "💡 الزقهم في الـ tab التاني في الـ Google Sheet "
                             "(الأعمدة: db_team_name | sofascore_team_name) "
                             "وبعدين اضغط 🔄 تحديث الـ Mapping في الـ sidebar وشغّل تاني"
+                        )
+
+            # ── 🔎 ليه ماتشات DB مالقتش مقابل؟ ────────────────────────────────
+            diag = st.session_state.get("diag_unmatched")
+            if diag is not None and len(diag) > 0:
+                with st.expander(f"🔎 تشخيص: {len(diag)} ماتش DB مالقاش أي مرشح للمقارنة", expanded=False):
+                    st.caption(
+                        "الماتشات دي مالقتش ولا ماتش SofaScore واحد تقارن بيه — "
+                        "السبب في عمود 'reason'. لو السبب mapping ناقص، صلّحه في الـ Master tab."
+                    )
+
+                    reason_counts = diag["reason"].value_counts()
+                    for reason, cnt in reason_counts.items():
+                        st.write(f"- **{cnt}** ماتش: {reason}")
+
+                    st.dataframe(
+                        diag.rename(columns={
+                            "competition":     "البطولة",
+                            "competition_id":  "Comp ID",
+                            "home_team":       "الهوم",
+                            "away_team":       "الأواي",
+                            "match_date":      "التاريخ",
+                            "mapped_sf_ids":   "SF IDs المربوطة",
+                            "sf_on_that_date": "ماتشات SF في اليوم",
+                            "sf_tids_present": "SF tournament_ids موجودة",
+                            "reason":          "السبب",
+                        }),
+                        use_container_width=True,
+                        height=320,
+                    )
+
+                    # Which competitions need mapping work?
+                    unmapped = diag[diag["mapped_sf_ids"] == "— مفيش mapping"]
+                    if len(unmapped) > 0:
+                        comps = sorted(set(zip(unmapped["competition_id"], unmapped["competition"])))
+                        st.warning(
+                            "**بطولات محتاجة mapping في الـ Master tab:**\n\n" +
+                            "\n".join(f"- `{cid}` — {name}" for cid, name in comps[:30])
                         )
 
             with st.expander("👁️ بيانات SofaScore الخام"):
